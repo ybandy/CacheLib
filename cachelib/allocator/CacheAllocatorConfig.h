@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -190,6 +191,8 @@ class CacheAllocatorConfig {
   //
   // If memory monitor is enabled, this is not usually needed.
   CacheAllocatorConfig& setMemoryLocking(bool enable);
+
+  CacheAllocatorConfig& setPrefetchDelayNSec(uint64_t nsec);
 
   // This allows cache to be persisted across restarts. One example use case is
   // to preserve the cache when releasing a new version of your service. Refer
@@ -575,6 +578,8 @@ class CacheAllocatorConfig {
   // This option has no effect when attaching to existing cache.
   bool lockMemory{false};
 
+  uint64_t prefetchDelayNSec{0};
+
   // These configs configure how MemoryAllocator will be generating
   // allocation class sizes for each pool by default
   double allocationClassSizeFactor{1.25};
@@ -835,6 +840,13 @@ template <typename T>
 CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::setMemoryLocking(
     bool enable) {
   lockMemory = enable;
+  return *this;
+}
+
+template <typename T>
+CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::setPrefetchDelayNSec(
+    uint64_t nsec) {
+  prefetchDelayNSec = nsec;
   return *this;
 }
 

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,8 +21,8 @@ namespace cachelib {
 /* Container Interface Implementation */
 template <typename T, MM2Q::Hook<T> T::*HookPtr>
 MM2Q::Container<T, HookPtr>::Container(const serialization::MM2QObject& object,
-                                       PtrCompressor compressor)
-    : lru_(*object.lrus(), compressor),
+                                       PtrCompressor compressor, Prefetcher prefetcher)
+    : lru_(*object.lrus(), compressor, prefetcher),
       tailTrackingEnabled_(*object.tailTrackingEnabled()),
       config_(*object.config()) {
   lruRefreshTime_ = config_.lruRefreshTime;
@@ -35,8 +36,8 @@ MM2Q::Container<T, HookPtr>::Container(const serialization::MM2QObject& object,
   if (object.lrus()->lists()->size() < LruType::NumTypes) {
     XDCHECK_EQ(false, tailTrackingEnabled_);
     XDCHECK_EQ(object.lrus()->lists()->size() + 2, LruType::NumTypes);
-    lru_.insertEmptyListAt(LruType::WarmTail, compressor);
-    lru_.insertEmptyListAt(LruType::ColdTail, compressor);
+    lru_.insertEmptyListAt(LruType::WarmTail, compressor, prefetcher);
+    lru_.insertEmptyListAt(LruType::ColdTail, compressor, prefetcher);
   }
 }
 
@@ -221,7 +222,7 @@ void MM2Q::Container<T, HookPtr>::rebalance() noexcept {
 }
 
 template <typename T, MM2Q::Hook<T> T::*HookPtr>
-bool MM2Q::Container<T, HookPtr>::add(T& node) noexcept {
+bool MM2Q::Container<T, HookPtr>::add(T& node, uint64_t hash) noexcept {
   const auto currTime = static_cast<Time>(util::getCurrentTimeSec());
   return lruMutex_->lock_combine([this, &node, currTime]() {
     if (node.isInMMContainer()) {

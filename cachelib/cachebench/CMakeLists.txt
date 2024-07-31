@@ -1,4 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# Copyright (c) 2024 Kioxia Corporation.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -48,6 +49,7 @@ endif()
 
 add_executable (cachebench main.cpp)
 target_link_libraries(cachebench cachelib_cachebench)
+set_property(TARGET cachebench PROPERTY ENABLE_EXPORTS true)
 
 install(
   TARGETS

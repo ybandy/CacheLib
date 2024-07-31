@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,6 +32,7 @@
 #include "cachelib/allocator/datastruct/SList.h"
 #include "cachelib/allocator/memory/CompressedPtr.h"
 #include "cachelib/allocator/memory/MemoryAllocator.h"
+#include "cachelib/allocator/memory/Prefetcher.h"
 #include "cachelib/common/CompilerUtils.h"
 #include "cachelib/common/Exceptions.h"
 #include "cachelib/common/Mutex.h"
@@ -142,6 +144,8 @@ class CACHELIB_PACKED_ATTR CacheItem {
    */
   using CompressedPtr = facebook::cachelib::CompressedPtr;
   using PtrCompressor = MemoryAllocator::PtrCompressor<Item>;
+
+  using Prefetcher = MemoryAllocator::Prefetcher;
 
   // Get the required size for a cache item given the size of memory
   // user wants to allocate and the key size for the item

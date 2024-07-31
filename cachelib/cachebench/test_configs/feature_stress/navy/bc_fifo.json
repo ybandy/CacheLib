@@ -1,19 +1,25 @@
 // @nolint config that uses block cache for all the objects
 {
   "cache_config" : {
+    "navyTryBlocking": true,
+
     "cacheSizeMB" : 128,
     "poolRebalanceIntervalSec" : 1,
     "moveOnSlabRelease" : false,
 
-    "nvmCacheSizeMB" : 512,
+    "nvmCachePaths" : ["/dev/nvme0n1"],
+    "nvmCacheSizeMB" : 51200,
     "navySegmentedFifoSegmentRatio": [1],
     "navyBigHashSizePct": 0
   },
   "test_config" : 
     {
       
+      "numFibers": 4,
+      "yieldPerOps": 1,
+      "checkConsistency" : true,
 
-      "numOps" : 100000000,
+      "numOps" : 10000000,
       "numThreads" : 32,
       "numKeys" : 100000,
       

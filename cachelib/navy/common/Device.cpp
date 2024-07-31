@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +15,18 @@
  * limitations under the License.
  */
 
+#include "cachelib/allocator/memory/Prefetcher.h"
 #include "cachelib/navy/common/Device.h"
 
 #include <folly/File.h>
 #include <folly/Format.h>
+#include <folly/ThreadLocal.h>
+#include <folly/experimental/io/IoUring.h>
+#include <folly/fibers/FiberManager.h>
 
 #include <cstring>
 #include <numeric>
+#include <iostream>
 
 namespace facebook {
 namespace cachelib {
@@ -28,7 +34,7 @@ namespace navy {
 namespace {
 
 using IOOperation =
-    std::function<ssize_t(int fd, void* buf, size_t count, off_t offset)>;
+    std::function<ssize_t(int fdIdx, void* buf, size_t count, off_t offset)>;
 
 // Device on Unix file descriptor
 class FileDevice final : public Device {
@@ -46,8 +52,46 @@ class FileDevice final : public Device {
   ~FileDevice() override {}
 
  private:
+  folly::IoUring* getIoUring() {
+    folly::IoUring* ioUring = ioUring_.get();
+    if (!ioUring) {
+      ioUring = new folly::IoUring(1024, folly::AsyncBase::NOT_POLLABLE, 128);
+      ioUring->initializeContext();
+      ioUring_.reset(ioUring);
+    }
+    return ioUring;
+  }
+
   bool writeImpl(uint64_t offset, uint32_t size, const void* value) override {
+    if (folly::fibers::onFiber()) {
+      folly::IoUring* ioUring = getIoUring();
+      folly::IoUring::Op writeOp;
+      size_t completed = 0;
+
+      writeOp.setNotificationCallback(
+          [&](folly::AsyncBaseOp*) { ++completed; });
+      writeOp.pwrite(file_.fd(), value, size, offset);
+      CheckpointTracer::record(kWriteSubmitBegin);
+      ioUring->submit(&writeOp);
+      CheckpointTracer::record(kWriteSubmitEnd);
+      do {
+        if (ioUring->wait(0).size() && completed) {
+          break;
+        }
+        CheckpointTracer::record(kWriteYieldBegin);
+        folly::fibers::yield();
+        CheckpointTracer::record(kWriteYieldEnd);
+      } while (!completed);
+      ssize_t bytesWritten = writeOp.result();
+      if (bytesWritten != size) {
+        reportIOError("write", offset, size, bytesWritten);
+      }
+      return bytesWritten == size;
+    }
+
+    CheckpointTracer::record(kWriteBegin);
     ssize_t bytesWritten = ::pwrite(file_.fd(), value, size, offset);
+    CheckpointTracer::record(kWriteEnd);
     if (bytesWritten != size) {
       reportIOError("write", offset, size, bytesWritten);
     }
@@ -55,7 +99,35 @@ class FileDevice final : public Device {
   }
 
   bool readImpl(uint64_t offset, uint32_t size, void* value) override {
+    if (folly::fibers::onFiber()) {
+      folly::IoUring* ioUring = getIoUring();
+      folly::IoUring::Op readOp;
+      size_t completed = 0;
+
+      readOp.setNotificationCallback(
+          [&](folly::AsyncBaseOp*) { ++completed; });
+      readOp.pread(file_.fd(), value, size, offset);
+      CheckpointTracer::record(kReadSubmitBegin);
+      ioUring->submit(&readOp);
+      CheckpointTracer::record(kReadSubmitEnd);
+      do {
+        if (ioUring->wait(0).size() && completed) {
+          break;
+        }
+        CheckpointTracer::record(kReadYieldBegin);
+        folly::fibers::yield();
+        CheckpointTracer::record(kReadYieldEnd);
+      } while (!completed);
+      ssize_t bytesRead = readOp.result();
+      if (bytesRead != size) {
+        reportIOError("read", offset, size, bytesRead);
+      }
+      return bytesRead == size;
+    }
+
+    CheckpointTracer::record(kReadBegin);
     ssize_t bytesRead = ::pread(file_.fd(), value, size, offset);
+    CheckpointTracer::record(kReadEnd);
     if (bytesRead != size) {
       reportIOError("read", offset, size, bytesRead);
     }
@@ -76,6 +148,7 @@ class FileDevice final : public Device {
   }
 
   const folly::File file_{};
+  folly::ThreadLocalPtr<folly::IoUring> ioUring_;
 };
 
 // RAID0 device spanning multiple files
@@ -90,6 +163,7 @@ class RAID0Device final : public Device {
       : Device{fdSize * fvec.size(), std::move(encryptor), ioAlignSize,
                maxDeviceWriteSize},
         fvec_{std::move(fvec)},
+        ioUringVec_(fvec_.size()),
         stripeSize_(stripeSize) {
     XDCHECK_GT(ioAlignSize, 0u);
     XDCHECK_GT(stripeSize_, 0u);
@@ -110,13 +184,85 @@ class RAID0Device final : public Device {
   ~RAID0Device() override {}
 
  private:
+  folly::IoUring* getIoUring(int fdIdx) {
+    folly::IoUring* ioUring = ioUringVec_[fdIdx].get();
+    if (!ioUring) {
+      ioUring = new folly::IoUring(1024, folly::AsyncBase::NOT_POLLABLE, 128);
+      ioUring->initializeContext();
+      ioUringVec_[fdIdx].reset(ioUring);
+    }
+    return ioUring;
+  }
+
   bool writeImpl(uint64_t offset, uint32_t size, const void* value) override {
-    IOOperation io = ::pwrite;
+    IOOperation io;
+    if (folly::fibers::onFiber()) {
+      io = [this](int fdIdx, void* buf, size_t count, off_t offset) {
+          folly::IoUring* ioUring = getIoUring(fdIdx);
+          folly::IoUring::Op writeOp;
+          size_t completed = 0;
+
+          writeOp.setNotificationCallback(
+              [&](folly::AsyncBaseOp*) { ++completed; });
+          writeOp.pwrite(fvec_[fdIdx].fd(), buf, count, offset);
+          CheckpointTracer::record(kWriteSubmitBegin);
+          ioUring->submit(&writeOp);
+          CheckpointTracer::record(kWriteSubmitEnd);
+          do {
+            CheckpointTracer::record(kWriteYieldBegin);
+            folly::fibers::yield();
+            CheckpointTracer::record(kWriteYieldEnd);
+            if (completed) {
+              break;
+            }
+            ioUring->wait(0);
+          } while (!completed);
+          return writeOp.result();
+      };
+    } else {
+      io = [this](int fdIdx, void* buf, size_t count, off_t offset) {
+        CheckpointTracer::record(kWriteBegin);
+        auto ret = ::pwrite(fvec_[fdIdx].fd(), buf, count, offset);
+        CheckpointTracer::record(kWriteEnd);
+        return ret;
+      };
+    }
     return doIO(offset, size, const_cast<void*>(value), "RAID0 WRITE", io);
   }
 
   bool readImpl(uint64_t offset, uint32_t size, void* value) override {
-    IOOperation io = ::pread;
+    IOOperation io;
+    if (folly::fibers::onFiber()) {
+      io = [this](int fdIdx, void* buf, size_t count, off_t offset) {
+          folly::IoUring* ioUring = getIoUring(fdIdx);
+          folly::IoUring::Op readOp;
+          size_t completed = 0;
+
+          readOp.setNotificationCallback(
+              [&](folly::AsyncBaseOp*) { ++completed; });
+          readOp.pread(fvec_[fdIdx].fd(), buf, count, offset);
+          CheckpointTracer::record(kReadSubmitBegin);
+          ioUring->submit(&readOp);
+          CheckpointTracer::record(kReadSubmitEnd);
+          do {
+            CheckpointTracer::record(kReadYieldBegin);
+            folly::fibers::yield();
+            CheckpointTracer::record(kReadYieldEnd);
+            if (completed) {
+              break;
+            }
+            ioUring->wait(0);
+          } while (!completed);
+          return readOp.result();
+      };
+    } else {
+      io = [this](int fdIdx, void* buf, size_t count, off_t offset) {
+          CheckpointTracer::record(kReadBegin);
+          auto ret = ::pread(fvec_[fdIdx].fd(), buf, count, offset);
+          CheckpointTracer::record(kReadEnd);
+          return ret;
+      };
+    }
     return doIO(offset, size, value, "RAID0 READ", io);
   }
 
@@ -140,7 +286,7 @@ class RAID0Device final : public Device {
       uint32_t ioOffsetInStripe = offset % stripeSize_;
       uint32_t allowedIOSize = std::min(size, stripeSize_ - ioOffsetInStripe);
 
-      ssize_t retSize = io(fvec_[fdIdx].fd(),
+      ssize_t retSize = io(fdIdx,
                            buf,
                            allowedIOSize,
                            stripeStartOffset + ioOffsetInStripe);
@@ -173,6 +319,7 @@ class RAID0Device final : public Device {
   }
 
   const std::vector<folly::File> fvec_{};
+  std::vector<folly::ThreadLocalPtr<folly::IoUring>> ioUringVec_;
   const uint32_t stripeSize_{};
 };
 

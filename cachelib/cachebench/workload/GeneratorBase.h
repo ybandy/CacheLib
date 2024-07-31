@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,7 +37,7 @@ class GeneratorBase {
   // @param gen random number generator
   // @param lastRequestId generator may generate next request based on last
   // request, e.g., piecewise caching in bigcache.
-  virtual const Request& getReq(uint8_t /*poolId*/,
+  virtual const Request& getReq(uint16_t /*poolId*/,
                                 std::mt19937_64& /*gen*/,
                                 std::optional<uint64_t> /*lastRequestId*/) = 0;
 
@@ -48,6 +49,10 @@ class GeneratorBase {
 
   // Notify the workload generator that the nvm cache has already warmed up.
   virtual void setNvmCacheWarmedUp(uint64_t /*timestamp*/) {
+    // not implemented by default
+  }
+
+  virtual void renderDistribution(std::ostream& /*out*/) const {
     // not implemented by default
   }
 

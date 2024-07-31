@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -53,7 +54,7 @@ namespace cachelib {
 // identifier for the memory tier
 using TierId = int8_t;
 // identifier for the memory pool
-using PoolId = int8_t;
+using PoolId = int16_t;
 // identifier for the allocation class
 using ClassId = int8_t;
 // slab release abort function to determine if slab release should be aborted

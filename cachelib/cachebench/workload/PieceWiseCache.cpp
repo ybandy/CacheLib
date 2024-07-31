@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,7 +26,7 @@ namespace cachelib {
 namespace cachebench {
 
 void PieceWiseCacheStats::InternalStats::updateTimestamp(uint64_t timestamp) {
-  std::lock_guard<std::mutex> lck(tsMutex_);
+  std::lock_guard<YieldableMutex> lck(tsMutex_);
   if (startTimestamp_ > timestamp || startTimestamp_ == 0) {
     startTimestamp_ = timestamp;
   }
@@ -39,7 +40,7 @@ std::pair<uint64_t, uint64_t>
 PieceWiseCacheStats::InternalStats::getTimestamps() {
   std::pair<uint64_t, uint64_t> result;
   {
-    std::lock_guard<std::mutex> lck(tsMutex_);
+    std::lock_guard<YieldableMutex> lck(tsMutex_);
     result = {startTimestamp_, endTimestamp_};
   }
   return result;
@@ -361,7 +362,7 @@ PieceWiseReqWrapper::PieceWiseReqWrapper(
           sizes.end(),
           opType,
           ttl,
-          reqId,
+          reinterpret_cast<uint64_t>(this), /* reqId, */
           admFeatureM,
           itemValue),
       requestRange(rangeStart, rangeEnd),
@@ -402,7 +403,7 @@ PieceWiseReqWrapper::PieceWiseReqWrapper(const PieceWiseReqWrapper& other)
           sizes.end(),
           other.req.getOp(),
           other.req.ttlSecs,
-          other.req.requestId.value(),
+          reinterpret_cast<uint64_t>(this), /* other.req.requestId.value(), */
           other.req.admFeatureMap,
           other.req.itemValue),
       requestRange(other.requestRange),

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,6 +31,9 @@ StressorConfig::StressorConfig(const folly::dynamic& configJson) {
   JSONSetVal(configJson, name);
 
   JSONSetVal(configJson, enableLookaside);
+  JSONSetVal(configJson, numFibers);
+  JSONSetVal(configJson, yieldPerOps);
+  JSONSetVal(configJson, affinitizeThreads);
   JSONSetVal(configJson, onlySetIfMiss);
   JSONSetVal(configJson, ignoreOpCount);
   JSONSetVal(configJson, populateItem);
@@ -55,6 +59,8 @@ StressorConfig::StressorConfig(const folly::dynamic& configJson) {
 
   JSONSetVal(configJson, traceFileName);
   JSONSetVal(configJson, traceFileNames);
+  JSONSetVal(configJson, traceFileMultiStreams);
+  JSONSetVal(configJson, numTraceFileCheckpoints);
   JSONSetVal(configJson, configPath);
 
   JSONSetVal(configJson, cachePieceSize);
@@ -90,7 +96,7 @@ StressorConfig::StressorConfig(const folly::dynamic& configJson) {
   // If you added new fields to the configuration, update the JSONSetVal
   // to make them available for the json configs and increment the size
   // below
-  checkCorrectSize<StressorConfig, 504>();
+  checkCorrectSize<StressorConfig, 552>();
 }
 
 bool StressorConfig::usesChainedItems() const {
@@ -201,6 +207,7 @@ ReplayGeneratorConfig::ReplayGeneratorConfig(const folly::dynamic& configJson) {
   JSONSetVal(configJson, relaxedSerialIntervalMs);
   JSONSetVal(configJson, numAggregationFields);
   JSONSetVal(configJson, numExtraFields);
+  JSONSetVal(configJson, maxKeyPrefixSize);
   JSONSetVal(configJson, statsPerAggField);
 
   if (configJson.count("mlAdmissionConfig")) {
@@ -215,7 +222,7 @@ ReplayGeneratorConfig::ReplayGeneratorConfig(const folly::dynamic& configJson) {
         "Unsupported request serialization mode: {}", replaySerializationMode));
   }
 
-  checkCorrectSize<ReplayGeneratorConfig, 128>();
+  checkCorrectSize<ReplayGeneratorConfig, 136>();
 }
 
 ReplayGeneratorConfig::SerializeMode

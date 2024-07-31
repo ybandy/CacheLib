@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -56,6 +57,7 @@ class ChainedHashTable {
     using BucketId = size_t;
     using CompressedPtr = typename T::CompressedPtr;
     using PtrCompressor = typename T::PtrCompressor;
+    using Prefetcher = typename T::Prefetcher;
 
     // allocate memory for hash table; the memory is managed by Impl.
     //
@@ -64,6 +66,7 @@ class ChainedHashTable {
     // @param hasher        object used to hash the key for its bucket id
     Impl(size_t numBuckets,
          const PtrCompressor& compressor,
+         const Prefetcher& prefetcher,
          const Hasher& hasher);
 
     // allocate memory for hash table; the memory is managed by the user.
@@ -77,6 +80,7 @@ class ChainedHashTable {
     Impl(size_t numBuckets,
          void* memStart,
          const PtrCompressor& compressor,
+         const Prefetcher& prefetcher,
          const Hasher& hasher,
          bool resetMem = false);
 
@@ -185,6 +189,8 @@ class ChainedHashTable {
     // object used to compress/decompress node pointers to reduce memory
     // footprint of Hook
     const PtrCompressor compressor_;
+
+    const Prefetcher prefetcher_;
 
     // Hash the key
     const Hasher hasher_;
@@ -341,6 +347,7 @@ class ChainedHashTable {
     using HandleMaker = typename T::HandleMaker;
     using CompressedPtr = typename T::CompressedPtr;
     using PtrCompressor = typename T::PtrCompressor;
+    using Prefetcher = typename T::Prefetcher;
 
     // default handle maker that calls incRef
     static const HandleMaker kDefaultHandleMaker;
@@ -355,10 +362,12 @@ class ChainedHashTable {
     // @param hm          the functor that creates a Handle from T*
     Container(Config c,
               const PtrCompressor& compressor,
+              const Prefetcher& prefetcher,
               HandleMaker hm = kDefaultHandleMaker)
         : config_(std::move(c)),
           handleMaker_(std::move(hm)),
-          ht_{config_.getNumBuckets(), compressor, config_.getHasher()},
+          prefetcher_(prefetcher),
+          ht_{config_.getNumBuckets(), compressor, prefetcher, config_.getHasher()},
           locks_{config_.getLocksPower(), config_.getHasher()} {}
 
     // create hash table container with user-managed memory
@@ -370,10 +379,12 @@ class ChainedHashTable {
     Container(Config c,
               void* memStart,
               const PtrCompressor& compressor,
+              const Prefetcher& prefetcher,
               HandleMaker hm = kDefaultHandleMaker)
         : config_(std::move(c)),
           handleMaker_(std::move(hm)),
-          ht_{config_.getNumBuckets(), memStart, compressor,
+          prefetcher_(prefetcher),
+          ht_{config_.getNumBuckets(), memStart, compressor, prefetcher,
               config_.getHasher(), true /* resetMem */},
           locks_{config_.getLocksPower(), config_.getHasher()} {}
 
@@ -392,6 +403,7 @@ class ChainedHashTable {
               const Config& newConfig,
               ShmAddr memSegment,
               const PtrCompressor& compressor,
+              const Prefetcher& prefetcher,
               HandleMaker hm = kDefaultHandleMaker);
 
     // restore hash table from previous state. This only works when the
@@ -412,6 +424,7 @@ class ChainedHashTable {
               void* memStart,
               size_t nBytes,
               const PtrCompressor& compressor,
+              const Prefetcher& prefetcher,
               HandleMaker hm = kDefaultHandleMaker);
 
     Container(const Container&) = delete;
@@ -656,6 +669,8 @@ class ChainedHashTable {
 
     // handle maker to convert the T* to T::Handle
     HandleMaker handleMaker_;
+
+    const Prefetcher prefetcher_;
 
     // the hashtable buckets
     Hashtable ht_;

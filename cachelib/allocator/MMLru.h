@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +19,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <vector>
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wconversion"
@@ -52,6 +54,8 @@ class MMLru {
  public:
   // unique identifier per MMType
   static const int kId;
+
+  static constexpr size_t kShards = 32;
 
   // forward declaration;
   template <typename T>
@@ -247,27 +251,32 @@ class MMLru {
   struct Container {
    private:
     using LruList = DList<T, HookPtr>;
-    using Mutex = folly::DistributedMutex;
+    using Mutex = YieldableMutex;
     using LockHolder = std::unique_lock<Mutex>;
     using PtrCompressor = typename T::PtrCompressor;
     using Time = typename Hook<T>::Time;
     using CompressedPtr = typename T::CompressedPtr;
     using RefFlags = typename T::Flags;
+    using Prefetcher = typename T::Prefetcher;
 
    public:
     Container() = default;
-    Container(Config c, PtrCompressor compressor)
+    Container(Config c, PtrCompressor compressor, Prefetcher prefetcher)
         : compressor_(std::move(compressor)),
-          lru_(compressor_),
+          prefetcher_(std::move(prefetcher)),
           config_(std::move(c)) {
-      lruRefreshTime_ = config_.lruRefreshTime;
-      nextReconfigureTime_ =
+      for (int i = 0; i < kShards; i++) {
+        lru_.emplace_back(std::make_unique<Lru>(compressor_, prefetcher_));
+        auto lru = lru_[i].get();
+        lru->lruRefreshTime_ = config_.lruRefreshTime;
+        lru->nextReconfigureTime_ =
           config_.mmReconfigureIntervalSecs.count() == 0
               ? std::numeric_limits<Time>::max()
               : static_cast<Time>(util::getCurrentTimeSec()) +
                     config_.mmReconfigureIntervalSecs.count();
+      }
     }
-    Container(serialization::MMLruObject object, PtrCompressor compressor);
+    Container(serialization::MMLruObject object, PtrCompressor compressor, Prefetcher prefetcher);
 
     Container(const Container&) = delete;
     Container& operator=(const Container&) = delete;
@@ -337,7 +346,7 @@ class MMLru {
     // @return  True if the node was successfully added to the container. False
     //          if the node was already in the contianer. On error state of node
     //          is unchanged.
-    bool add(T& node) noexcept;
+    bool add(T& node, uint64_t hash) noexcept;
 
     // removes the node from the lru and sets it previous and next to nullptr.
     //
@@ -382,16 +391,18 @@ class MMLru {
     // override the existing config with the new one.
     void setConfig(const Config& newConfig);
 
-    bool isEmpty() const noexcept { return size() == 0; }
+    // bool isEmpty() const noexcept { return size() == 0; }
 
     // reconfigure the MMContainer: update refresh time according to current
     // tail age
-    void reconfigureLocked(const Time& currTime);
+    void reconfigureLocked(int shard, const Time& currTime);
 
     // returns the number of elements in the container
+    /*
     size_t size() const noexcept {
       return lruMutex_->lock_combine([this]() { return lru_.size(); });
     }
+    */
 
     // Returns the eviction age stats. See CacheStats.h for details
     EvictionAgeStat getEvictionAgeStat(uint64_t projectedLength) const noexcept;
@@ -412,7 +423,11 @@ class MMLru {
     }
 
    private:
+
+    void setConfigLocked(int shard, const Config& newConfig);
+
     EvictionAgeStat getEvictionAgeStatLocked(
+        int shard,
         uint64_t projectedLength) const noexcept;
 
     static Time getUpdateTime(const T& node) noexcept {
@@ -421,6 +436,17 @@ class MMLru {
 
     static void setUpdateTime(T& node, Time time) noexcept {
       (node.*HookPtr).setUpdateTime(time);
+    }
+
+    static int getShard(const T& node) noexcept {
+      int shard = (node.*HookPtr).getShard();
+      XDCHECK(shard >= 0 && shard < kShards);
+      return shard;
+    }
+
+    static void setShard(T& node, int shard) noexcept {
+      XDCHECK(shard >= 0 && shard < kShards);
+      (node.*HookPtr).setShard(shard);
     }
 
     // This function is invoked by remove or record access prior to
@@ -432,7 +458,7 @@ class MMLru {
     // update the lru insertion point after doing an insert or removal.
     // We need to ensure the insertionPoint_ is set to the correct node
     // to maintain the tailSize_, for the next insertion.
-    void updateLruInsertionPoint() noexcept;
+    void updateLruInsertionPoint(int shard) noexcept;
 
     // remove node from lru and adjust insertion points
     // @param node          node to remove
@@ -467,15 +493,14 @@ class MMLru {
       return node.template isFlagSet<RefFlags::kMMFlag1>();
     }
 
+    struct Lru {
     // protects all operations on the lru. We never really just read the state
     // of the LRU. Hence we dont really require a RW mutex at this point of
     // time.
     mutable folly::cacheline_aligned<Mutex> lruMutex_;
 
-    const PtrCompressor compressor_{};
-
-    // the lru
-    LruList lru_{};
+      // the lru
+      LruList list_{};
 
     // insertion point
     T* insertionPoint_{nullptr};
@@ -488,6 +513,20 @@ class MMLru {
 
     // How often to promote an item in the eviction queue.
     std::atomic<uint32_t> lruRefreshTime_{};
+
+      explicit Lru(PtrCompressor compressor, Prefetcher prefetcher) noexcept
+          : list_(compressor, prefetcher) {}
+
+      Lru(const serialization::DListObject& object, PtrCompressor compressor, Prefetcher prefetcher)
+          : list_(object, compressor, prefetcher) {}
+    };
+
+    //struct Lru* lru_;
+    std::vector<std::unique_ptr<Lru>> lru_;
+
+    const PtrCompressor compressor_{};
+
+    const Prefetcher prefetcher_;
 
     // Config for this lru.
     // Write access to the MMLru Config is serialized.

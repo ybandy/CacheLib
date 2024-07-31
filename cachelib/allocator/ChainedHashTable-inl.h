@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,10 +30,12 @@ namespace cachelib {
 template <typename T, typename ChainedHashTable::Hook<T> T::*HookPtr>
 ChainedHashTable::Impl<T, HookPtr>::Impl(size_t numBuckets,
                                          const PtrCompressor& compressor,
+                                         const Prefetcher& prefetcher,
                                          const Hasher& hasher)
     : numBuckets_(numBuckets),
       numBucketsMask_(numBuckets - 1),
       compressor_(compressor),
+      prefetcher_(prefetcher),
       hasher_(hasher) {
   if (numBuckets == 0) {
     throw std::invalid_argument("Can not have 0 buckets");
@@ -49,6 +52,7 @@ template <typename T, typename ChainedHashTable::Hook<T> T::*HookPtr>
 ChainedHashTable::Impl<T, HookPtr>::Impl(size_t numBuckets,
                                          void* memStart,
                                          const PtrCompressor& compressor,
+                                         const Prefetcher& prefetcher,
                                          const Hasher& hasher,
                                          bool resetMem)
     : numBuckets_(numBuckets),
@@ -56,6 +60,7 @@ ChainedHashTable::Impl<T, HookPtr>::Impl(size_t numBuckets,
       hashTable_(static_cast<CompressedPtr*>(memStart)),
       restorable_(true),
       compressor_(compressor),
+      prefetcher_(prefetcher),
       hasher_(hasher) {
   if (numBuckets == 0) {
     throw std::invalid_argument("Can not have 0 buckets");
@@ -107,12 +112,14 @@ T* ChainedHashTable::Impl<T, HookPtr>::insertOrReplaceInBucket(
 
   // See if we can find the key and the previous node
   T* curr = compressor_.unCompress(hashTable_[bucket]);
+  prefetcher_.accessAccessContainerInsertOrReplace(curr);
   T* prev = nullptr;
 
   const auto key = node.getKey();
   while (curr != nullptr && key != curr->getKey()) {
     prev = curr;
     curr = getHashNext(*curr);
+    prefetcher_.accessAccessContainerInsertOrReplace(curr);
   }
 
   // insert if the key doesn't exist
@@ -158,8 +165,10 @@ T* ChainedHashTable::Impl<T, HookPtr>::findInBucket(
     Key key, BucketId bucket) const noexcept {
   XDCHECK_LT(bucket, numBuckets_);
   T* curr = compressor_.unCompress(hashTable_[bucket]);
+  prefetcher_.accessAccessContainerFind(curr, 127);
   while (curr != nullptr && curr->getKey() != key) {
     curr = getHashNext(*curr);
+    prefetcher_.accessAccessContainerFind(curr, 127);
   }
   return curr;
 }
@@ -169,12 +178,14 @@ T* ChainedHashTable::Impl<T, HookPtr>::findPrevInBucket(
     const T& node, BucketId bucket) const noexcept {
   XDCHECK_LT(bucket, numBuckets_);
   T* curr = compressor_.unCompress(hashTable_[bucket]);
+  prefetcher_.accessAccessContainerFindPrev(curr);
   T* prev = nullptr;
 
   const auto key = node.getKey();
   while (curr != nullptr && key != curr->getKey()) {
     prev = curr;
     curr = getHashNext(*curr);
+    prefetcher_.accessAccessContainerFindPrev(curr);
   }
   // node must be in the hashtable
   XDCHECK(curr != nullptr);
@@ -218,12 +229,14 @@ ChainedHashTable::Container<T, HookPtr, LockT>::Container(
     const Config& config,
     ShmAddr memSegment,
     const PtrCompressor& compressor,
+    const Prefetcher& prefetcher,
     HandleMaker hm)
     : Container(object,
                 config,
                 memSegment.addr,
                 memSegment.size,
                 compressor,
+                prefetcher,
                 std::move(hm)) {}
 
 template <typename T,
@@ -235,10 +248,12 @@ ChainedHashTable::Container<T, HookPtr, LockT>::Container(
     void* memStart,
     size_t nBytes,
     const PtrCompressor& compressor,
+    const Prefetcher& prefetcher,
     HandleMaker hm)
     : config_{config},
       handleMaker_(std::move(hm)),
-      ht_{config_.getNumBuckets(), memStart, compressor, config_.getHasher(),
+      prefetcher_(prefetcher),
+      ht_{config_.getNumBuckets(), memStart, compressor, prefetcher, config_.getHasher(),
           false /* resetMem */},
       locks_{config_.getLocksPower(), config_.getHasher()},
       numKeys_(*object.numKeys()) {
@@ -327,7 +342,9 @@ bool ChainedHashTable::Container<T, HookPtr, LockT>::insert(T& node) noexcept {
     return false;
   }
 
-  const auto bucket = ht_.getBucket(node.getKey());
+  const auto key = node.getKey();
+  prefetcher_.accessAccessContainerKeyInsert(key.data());
+  const auto bucket = ht_.getBucket(key);
   auto l = locks_.lockExclusive(bucket);
   const bool res = ht_.insertInBucket(node, bucket);
 
@@ -348,7 +365,9 @@ ChainedHashTable::Container<T, HookPtr, LockT>::insertOrReplace(T& node) {
     return handleMaker_(nullptr);
   }
 
-  const auto bucket = ht_.getBucket(node.getKey());
+  const auto key = node.getKey();
+  prefetcher_.accessAccessContainerKeyInsertOrReplace(key.data());
+  const auto bucket = ht_.getBucket(key);
   auto l = locks_.lockExclusive(bucket);
   T* oldNode = ht_.insertOrReplaceInBucket(node, bucket);
   XDCHECK_NE(reinterpret_cast<uintptr_t>(&node),
@@ -396,6 +415,7 @@ bool ChainedHashTable::Container<T, HookPtr, LockT>::replaceIf(T& oldNode,
                                                                T& newNode,
                                                                F&& predicate) {
   const auto key = newNode.getKey();
+  prefetcher_.accessAccessContainerKeyReplaceIf(key.data());
   const auto bucket = ht_.getBucket(key);
   auto l = locks_.lockExclusive(bucket);
 
@@ -412,7 +432,9 @@ template <typename T,
           typename ChainedHashTable::Hook<T> T::*HookPtr,
           typename LockT>
 bool ChainedHashTable::Container<T, HookPtr, LockT>::remove(T& node) noexcept {
-  const auto bucket = ht_.getBucket(node.getKey());
+  const auto key = node.getKey();
+  prefetcher_.accessAccessContainerKeyRemove(key.data());
+  const auto bucket = ht_.getBucket(key);
   auto l = locks_.lockExclusive(bucket);
 
   // check inside the lock to prevent from racing removes
@@ -432,7 +454,9 @@ template <typename T,
           typename LockT>
 typename T::Handle ChainedHashTable::Container<T, HookPtr, LockT>::removeIf(
     T& node, const std::function<bool(const T& node)>& predicate) {
-  const auto bucket = ht_.getBucket(node.getKey());
+  const auto key = node.getKey();
+  prefetcher_.accessAccessContainerKeyRemoveIf(key.data());
+  const auto bucket = ht_.getBucket(key);
   auto l = locks_.lockExclusive(bucket);
 
   // check inside the lock to prevent from racing removes

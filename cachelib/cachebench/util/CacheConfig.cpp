@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,6 +33,8 @@ CacheConfig::CacheConfig(const folly::dynamic& configJson) {
   JSONSetVal(configJson, rebalanceStrategy);
   JSONSetVal(configJson, rebalanceMinSlabs);
   JSONSetVal(configJson, rebalanceDiffRatio);
+
+  JSONSetVal(configJson, prefetchDelayNSec);
 
   JSONSetVal(configJson, htBucketPower);
   JSONSetVal(configJson, htLockPower);
@@ -74,8 +77,11 @@ CacheConfig::CacheConfig(const folly::dynamic& configJson) {
   JSONSetVal(configJson, navyProbabilityReinsertionThreshold);
   JSONSetVal(configJson, navyReaderThreads);
   JSONSetVal(configJson, navyWriterThreads);
+  JSONSetVal(configJson, navyTryBlocking);
   JSONSetVal(configJson, navyCleanRegions);
   JSONSetVal(configJson, navyAdmissionWriteRateMB);
+  JSONSetVal(configJson, navyBytesWrittenOffsetGB);
+  JSONSetVal(configJson, navyMaxWriteRateMB);
   JSONSetVal(configJson, navyMaxConcurrentInserts);
   JSONSetVal(configJson, navyDataChecksum);
   JSONSetVal(configJson, navyNumInmemBuffers);
@@ -99,13 +105,14 @@ CacheConfig::CacheConfig(const folly::dynamic& configJson) {
   JSONSetVal(configJson, tickerSynchingSeconds);
   JSONSetVal(configJson, enableItemDestructorCheck);
   JSONSetVal(configJson, enableItemDestructor);
+  JSONSetVal(configJson, disableItemReaper);
   JSONSetVal(configJson, nvmAdmissionRetentionTimeThreshold);
 
   JSONSetVal(configJson, customConfigJson);
   // if you added new fields to the configuration, update the JSONSetVal
   // to make them available for the json configs and increment the size
   // below
-  checkCorrectSize<CacheConfig, 728>();
+  checkCorrectSize<CacheConfig, 752>();
 
   if (numPools != poolSizes.size()) {
     throw std::invalid_argument(folly::sformat(

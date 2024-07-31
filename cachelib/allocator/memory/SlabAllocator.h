@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,6 +35,7 @@
 #include <folly/synchronization/SanitizeThread.h>
 
 #include "cachelib/allocator/memory/CompressedPtr.h"
+#include "cachelib/allocator/memory/Prefetcher.h"
 #include "cachelib/allocator/memory/Slab.h"
 #include "cachelib/common/Utils.h"
 
@@ -52,14 +54,16 @@ class SlabAllocator {
  public:
   struct Config {
     Config() {}
-    Config(bool _excludeFromCoreDump, bool _lockMemory)
-        : excludeFromCoredump(_excludeFromCoreDump), lockMemory(_lockMemory) {}
+    Config(bool _excludeFromCoreDump, bool _lockMemory, uint64_t _prefetchDelayNSec)
+        : excludeFromCoredump(_excludeFromCoreDump), lockMemory(_lockMemory), prefetchDelayNSec{_prefetchDelayNSec} {}
     // exclude the memory region from core dumps
     bool excludeFromCoredump{false};
 
     // lock the pages in memory, forcing to allocate them and retaining them in
     // memory even when untouched.
     bool lockMemory{false};
+
+    uint64_t prefetchDelayNSec{0};
   };
 
   // initialize the slab allocator for the range of memory starting from
@@ -322,6 +326,10 @@ class SlabAllocator {
     return PtrCompressor<PtrType, SlabAllocator>(*this);
   }
 
+  Prefetcher<SlabAllocator> createPrefetcher() const {
+    return Prefetcher<SlabAllocator>(*this, prefetchDelayNSec_);
+  }
+
  private:
   // null Slab* presenttation. With 4M Slab size, a valid slab index would never
   // reach 2^16 - 1;
@@ -415,6 +423,8 @@ class SlabAllocator {
   // boolean atomic that represents whether the allocator can allocate any
   // more slabs without holding any locks.
   std::atomic<bool> canAllocate_{true};
+
+  const uint64_t prefetchDelayNSec_{0};
 
   // whether the memory this slab allocator manages is mmaped by the caller.
   const bool ownsMemory_{true};

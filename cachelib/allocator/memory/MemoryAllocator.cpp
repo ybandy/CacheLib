@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,7 +36,7 @@ MemoryAllocator::MemoryAllocator(Config config,
     : config_(std::move(config)),
       slabAllocator_(memoryStart,
                      memSize,
-                     {config_.disableFullCoredump, config_.lockMemory}),
+                     {config_.disableFullCoredump, config_.lockMemory, config_.prefetchDelayNSec}),
       memoryPoolManager_(slabAllocator_) {
   checkConfig(config_);
 }
@@ -43,7 +44,7 @@ MemoryAllocator::MemoryAllocator(Config config,
 MemoryAllocator::MemoryAllocator(Config config, size_t memSize)
     : config_(std::move(config)),
       slabAllocator_(memSize,
-                     {config_.disableFullCoredump, config_.lockMemory}),
+                     {config_.disableFullCoredump, config_.lockMemory, config_.prefetchDelayNSec}),
       memoryPoolManager_(slabAllocator_) {
   checkConfig(config_);
 }
@@ -57,11 +58,11 @@ MemoryAllocator::MemoryAllocator(
                                  object.allocSizes()->end()},
               *object.enableZeroedSlabAllocs(),
               disableCoredump,
-              *object.lockMemory()),
+              *object.lockMemory(), 0 /* todo: update thrift file */),
       slabAllocator_(*object.slabAllocator(),
                      memoryStart,
                      memSize,
-                     {config_.disableFullCoredump, config_.lockMemory}),
+                     {config_.disableFullCoredump, config_.lockMemory, config_.prefetchDelayNSec}),
       memoryPoolManager_(*object.memoryPoolManager(), slabAllocator_) {
   checkConfig(config_);
 }

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -93,10 +94,19 @@ class KVReplayGenerator : public ReplayGeneratorBase {
       {SampleFields::TTL, false, {"ttl"}}};
 
   explicit KVReplayGenerator(const StressorConfig& config)
-      : ReplayGeneratorBase(config), traceStream_(config, 0, columnTable_) {
+      : ReplayGeneratorBase(config) {
     for (uint32_t i = 0; i < numShards_; ++i) {
       stressorCtxs_.emplace_back(std::make_unique<StressorCtx>(i));
+      if (config_.traceFileMultiStreams || (i == 0))
+        traceStreams_.emplace_back(std::make_unique<TraceFileStream>(config, i, columnTable_));
     }
+    if (config_.numFibers > 0) {
+      pthread_spin_init(&globalBarrier_.lock, 0);
+    } else {
+      pthread_barrier_init(&barrier_, nullptr, numShards_);
+    }
+    if (config_.traceFileMultiStreams)
+      return;
 
     genWorker_ = std::thread([this] {
       folly::setThreadName("cb_replay_gen");
@@ -117,7 +127,7 @@ class KVReplayGenerator : public ReplayGeneratorBase {
 
   // getReq generates the next request from the trace file.
   const Request& getReq(
-      uint8_t,
+      uint16_t,
       std::mt19937_64&,
       std::optional<uint64_t> lastRequestId = std::nullopt) override;
 
@@ -139,7 +149,7 @@ class KVReplayGenerator : public ReplayGeneratorBase {
 
   // for unit test
   bool setHeaderRow(const std::string& header) {
-    return traceStream_.setHeaderRow(header);
+    return getTraceFileStream().setHeaderRow(header);
   }
 
  private:
@@ -173,6 +183,15 @@ class KVReplayGenerator : public ReplayGeneratorBase {
     // Thread that finish its operations mark it here, so we will skip
     // further request on its shard
     std::atomic<bool> finished_{false};
+    std::unique_ptr<ReqWrapper> req_;
+    size_t keySuffix_{0};
+    uint64_t numTraces_{0};
+    struct LocalBarrier {
+      bool closed{false};
+    } localBarrier_;
+    uint64_t maxBarrierWait_{0};
+    uint64_t minBarrierWait_{UINT64_MAX};
+    uint64_t avgBarrierWait_{0};
   };
 
   // Read next trace line from TraceFileStream and fill ReqWrapper
@@ -189,7 +208,13 @@ class KVReplayGenerator : public ReplayGeneratorBase {
   // stressorIdx_ is used to index.
   std::vector<std::unique_ptr<StressorCtx>> stressorCtxs_;
 
-  TraceFileStream traceStream_;
+  std::vector<std::unique_ptr<TraceFileStream>> traceStreams_;
+
+  struct GlobalBarrier {
+    pthread_spinlock_t lock;
+    uint64_t counter{0};
+  } globalBarrier_;
+  pthread_barrier_t barrier_;
 
   std::thread genWorker_;
 
@@ -201,6 +226,8 @@ class KVReplayGenerator : public ReplayGeneratorBase {
   std::atomic<uint64_t> parseSuccess = 0;
 
   void genRequests();
+  void barrierCheckpoint(uint64_t numTraces);
+  bool genReq(std::unique_ptr<ReqWrapper>& req);
 
   void setEOF() { eof.store(true, std::memory_order_relaxed); }
   bool isEOF() { return eof.load(std::memory_order_relaxed); }
@@ -217,10 +244,20 @@ class KVReplayGenerator : public ReplayGeneratorBase {
 
     return getStressorCtx(*stressorIdx_);
   }
+
+  inline TraceFileStream& getTraceFileStream(size_t shardId) {
+    XCHECK_LT(shardId, numShards_);
+    return *traceStreams_[shardId];
+  }
+
+  inline TraceFileStream& getTraceFileStream() {
+    return config_.traceFileMultiStreams ? getTraceFileStream(*stressorIdx_) : getTraceFileStream(0);
+  }
 };
 
 inline bool KVReplayGenerator::parseRequest(const std::string& line,
                                             std::unique_ptr<ReqWrapper>& req) {
+  auto& traceStream_ = getTraceFileStream();
   if (!traceStream_.setNextLine(line)) {
     return false;
   }
@@ -289,6 +326,7 @@ inline bool KVReplayGenerator::parseRequest(const std::string& line,
 
 inline std::unique_ptr<ReqWrapper> KVReplayGenerator::getReqInternal() {
   auto reqWrapper = std::make_unique<ReqWrapper>();
+  auto& traceStream_ = getTraceFileStream();
   do {
     std::string line;
     traceStream_.getline(line); // can throw
@@ -303,6 +341,79 @@ inline std::unique_ptr<ReqWrapper> KVReplayGenerator::getReqInternal() {
   } while (reqWrapper->repeats_ == 0);
 
   return reqWrapper;
+}
+
+void KVReplayGenerator::barrierCheckpoint(uint64_t numTraces) {
+  auto& stressorCtx = getStressorCtx();
+
+  while (stressorCtx.localBarrier_.closed) {
+    folly::fibers::yield();
+  }
+
+  if ((numTraces % config_.numTraceFileCheckpoints) == 0) {
+    auto begin = util::getCurrentTimeMs();
+    if (config_.numFibers > 0) {
+      stressorCtx.localBarrier_.closed = true;
+      pthread_spin_lock(&globalBarrier_.lock);
+      globalBarrier_.counter++;
+      pthread_spin_unlock(&globalBarrier_.lock);
+      while (globalBarrier_.counter % numShards_) {
+        pthread_spin_unlock(&globalBarrier_.lock);
+        folly::fibers::yield();
+        pthread_spin_lock(&globalBarrier_.lock);
+      }
+      pthread_spin_unlock(&globalBarrier_.lock);
+      stressorCtx.localBarrier_.closed = false;
+    } else {
+      pthread_barrier_wait(&barrier_);
+    }
+    auto elapsed = util::getCurrentTimeMs() - begin;
+    if (stressorCtx.minBarrierWait_ > elapsed)
+      stressorCtx.minBarrierWait_ = elapsed;
+    if (stressorCtx.maxBarrierWait_ < elapsed)
+      stressorCtx.maxBarrierWait_ = elapsed;
+    XLOGF(INFO, "trace file checkpoint[{}]: elapsed={} min={} max={}", *stressorIdx_, elapsed,
+          stressorCtx.minBarrierWait_, stressorCtx.maxBarrierWait_);
+  }
+}
+
+bool KVReplayGenerator::genReq(std::unique_ptr<ReqWrapper>& req) {
+  XCHECK(config_.traceFileMultiStreams);
+  auto& stressorCtx = getStressorCtx();
+  if (shouldShutdown()) {
+    return false;
+  }
+  if (stressorCtx.keySuffix_ == 0) {
+    try {
+      uint64_t numTraces;
+      do {
+        stressorCtx.req_ = getReqInternal();
+        numTraces = stressorCtx.numTraces_++;
+        barrierCheckpoint(numTraces);
+      } while ((numTraces % numShards_) != *stressorIdx_);
+    } catch (const EndOfTrace& e) {
+      return false;
+    }
+  }
+
+  if (stressorCtx.keySuffix_ == ampFactor_ - 1) {
+    req.swap(stressorCtx.req_);
+  } else {
+    req = std::make_unique<ReqWrapper>(*stressorCtx.req_);
+  }
+
+  if (ampFactor_ > 1) {
+    if (req->key_.size() > 10) {
+      size_t newSize = std::max<size_t>(req->key_.size() - 4, 10u);
+      req->key_.resize(newSize, '0');
+    }
+    req->key_.append(folly::sformat("{:04d}", stressorCtx.keySuffix_));
+  }
+
+  stressorCtx.keySuffix_++;
+  stressorCtx.keySuffix_ %= ampFactor_;
+
+  return true;
 }
 
 inline void KVReplayGenerator::genRequests() {
@@ -351,7 +462,7 @@ inline void KVReplayGenerator::genRequests() {
   setEOF();
 }
 
-const Request& KVReplayGenerator::getReq(uint8_t,
+const Request& KVReplayGenerator::getReq(uint16_t,
                                          std::mt19937_64&,
                                          std::optional<uint64_t>) {
   std::unique_ptr<ReqWrapper> reqWrapper;
@@ -360,12 +471,19 @@ const Request& KVReplayGenerator::getReq(uint8_t,
   auto& reqQ = *stressorCtx.reqQueue_;
   auto& resubmitQueue = stressorCtx.resubmitQueue_;
 
+  if (config_.traceFileMultiStreams) {
+    if (resubmitQueue.empty() && !genReq(reqWrapper)) {
+      setEOF();
+      throw cachelib::cachebench::EndOfTrace("Test stopped or EOF reached");
+    }
+  } else {
   while (resubmitQueue.empty() && !reqQ.read(reqWrapper)) {
     if (resubmitQueue.empty() && isEOF()) {
       throw cachelib::cachebench::EndOfTrace("Test stopped or EOF reached");
     }
     // ProducerConsumerQueue does not support blocking, so use sleep
     std::this_thread::sleep_for(std::chrono::microseconds{checkIntervalUs_});
+  }
   }
 
   if (!reqWrapper) {

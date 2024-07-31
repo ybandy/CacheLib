@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,8 +21,8 @@ namespace cachelib {
 /* Container Interface Implementation */
 template <typename T, MMTinyLFU::Hook<T> T::*HookPtr>
 MMTinyLFU::Container<T, HookPtr>::Container(
-    serialization::MMTinyLFUObject object, PtrCompressor compressor)
-    : lru_(*object.lrus(), std::move(compressor)), config_(*object.config()) {
+    serialization::MMTinyLFUObject object, PtrCompressor compressor, Prefetcher prefetcher)
+    : lru_(*object.lrus(), std::move(compressor), std::move(prefetcher)), config_(*object.config()) {
   lruRefreshTime_ = config_.lruRefreshTime;
   nextReconfigureTime_ = config_.mmReconfigureIntervalSecs.count() == 0
                              ? std::numeric_limits<Time>::max()
@@ -176,7 +177,7 @@ void MMTinyLFU::Container<T, HookPtr>::maybePromoteTailLocked() noexcept {
 }
 
 template <typename T, MMTinyLFU::Hook<T> T::*HookPtr>
-bool MMTinyLFU::Container<T, HookPtr>::add(T& node) noexcept {
+bool MMTinyLFU::Container<T, HookPtr>::add(T& node, uint64_t hash) noexcept {
   const auto currTime = static_cast<Time>(util::getCurrentTimeSec());
   LockHolder l(lruMutex_);
   if (node.isInMMContainer()) {

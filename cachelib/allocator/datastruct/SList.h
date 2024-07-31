@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -60,6 +61,7 @@ class SList {
  public:
   using CompressedPtr = typename T::CompressedPtr;
   using PtrCompressor = typename T::PtrCompressor;
+  using Prefetcher = typename T::Prefetcher;
   using SListObject = serialization::SListObject;
 
   // Movable but not copyable
@@ -80,11 +82,12 @@ class SList {
     return *this;
   }
 
-  explicit SList(PtrCompressor compressor) noexcept
-      : compressor_(std::move(compressor)) {}
+  explicit SList(PtrCompressor compressor, Prefetcher prefetcher) noexcept
+      : compressor_(std::move(compressor)), prefetcher_(std::move(prefetcher)) {}
 
-  explicit SList(const SListObject& object, PtrCompressor compressor)
+  explicit SList(const SListObject& object, PtrCompressor compressor, Prefetcher prefetcher)
       : compressor_(std::move(compressor)),
+        prefetcher_(std::move(prefetcher)),
         size_(*object.size()),
         head_(compressor_.unCompress(CompressedPtr{*object.compressedHead()})) {
     // TODO(bwatling): eventually we'll always have 'compressedTail' and we can
@@ -234,6 +237,8 @@ class SList {
   }
 
   PtrCompressor compressor_;
+
+  Prefetcher prefetcher_;
 
   // Size of the list
   size_t size_{0};

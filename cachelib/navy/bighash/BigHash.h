@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +24,7 @@
 
 #include "cachelib/common/AtomicCounter.h"
 #include "cachelib/common/BloomFilter.h"
+#include "cachelib/common/Mutex.h"
 #include "cachelib/common/PercentileStats.h"
 #include "cachelib/navy/bighash/Bucket.h"
 #include "cachelib/navy/common/Buffer.h"
@@ -62,6 +64,7 @@ class BigHash final : public Engine {
     uint64_t cacheBaseOffset{};
     uint64_t cacheSize{};
     Device* device{nullptr};
+    bool checksum{};
 
     ExpiredCheck checkExpired;
     DestructorCallback destructorCb;
@@ -170,7 +173,7 @@ class BigHash final : public Engine {
   // could overwrite another's writes.
   //
   // In short, just hold the lock during the entire operation!
-  folly::SharedMutex& getMutex(BucketId bid) const {
+  YieldableSharedMutex& getMutex(BucketId bid) const {
     return mutex_[bid.index() & (kNumMutexes - 1)];
   }
 
@@ -193,6 +196,7 @@ class BigHash final : public Engine {
   // Serialization format version. Never 0. Versions < 10 reserved for testing.
   static constexpr uint32_t kFormatVersion = 10;
 
+  const bool checksumData_{};
   const ExpiredCheck checkExpired_{};
   const DestructorCallback destructorCb_{};
   const uint64_t bucketSize_{};
@@ -201,8 +205,8 @@ class BigHash final : public Engine {
   std::unique_ptr<BloomFilter> bloomFilter_;
   std::chrono::nanoseconds generationTime_{};
   Device& device_;
-  std::unique_ptr<folly::SharedMutex[]> mutex_{
-      new folly::SharedMutex[kNumMutexes]};
+  std::unique_ptr<YieldableSharedMutex[]> mutex_{
+      new YieldableSharedMutex[kNumMutexes]};
 
   // thread local counters in synchronized path
   mutable TLCounter lookupCount_;

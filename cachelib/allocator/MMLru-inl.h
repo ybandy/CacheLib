@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,18 +27,22 @@ bool areBytesSame(const T& one, const T& two) {
 /* Container Interface Implementation */
 template <typename T, MMLru::Hook<T> T::*HookPtr>
 MMLru::Container<T, HookPtr>::Container(serialization::MMLruObject object,
-                                        PtrCompressor compressor)
+                                        PtrCompressor compressor, Prefetcher prefetcher)
     : compressor_(std::move(compressor)),
-      lru_(*object.lru(), compressor_),
-      insertionPoint_(compressor_.unCompress(
-          CompressedPtr{*object.compressedInsertionPoint()})),
-      tailSize_(*object.tailSize()),
+      prefetcher_(std::move(prefetcher)),
       config_(*object.config()) {
-  lruRefreshTime_ = config_.lruRefreshTime;
-  nextReconfigureTime_ = config_.mmReconfigureIntervalSecs.count() == 0
+  for (int shard = 0; shard < kShards; shard++) {
+    lru_.emplace_back(std::make_unique<Lru>(*object.lru(), compressor_, prefetcher_));
+    auto lru = lru_[shard].get();
+    lru->tailSize_ = *object.tailSize();
+    lru->insertionPoint_ = compressor_.unCompress(
+          CompressedPtr{*object.compressedInsertionPoint()});
+    lru->lruRefreshTime_ = config_.lruRefreshTime;
+    lru->nextReconfigureTime_ = config_.mmReconfigureIntervalSecs.count() == 0
                              ? std::numeric_limits<Time>::max()
                              : static_cast<Time>(util::getCurrentTimeSec()) +
                                    config_.mmReconfigureIntervalSecs.count();
+  }
 }
 
 template <typename T, MMLru::Hook<T> T::*HookPtr>
@@ -48,28 +53,34 @@ bool MMLru::Container<T, HookPtr>::recordAccess(T& node,
     return false;
   }
 
+  prefetcher_.accessMMContainerRecordAccess(&node);
   const auto curr = static_cast<Time>(util::getCurrentTimeSec());
   // check if the node is still being memory managed
-  if (node.isInMMContainer() &&
-      ((curr >= getUpdateTime(node) +
-                    lruRefreshTime_.load(std::memory_order_relaxed)) ||
+  if (!node.isInMMContainer())
+    return false;
+
+  auto shard = getShard(node);
+  auto lru = lru_[shard].get();
+  if (((curr >= getUpdateTime(node) +
+                    lru->lruRefreshTime_.load(std::memory_order_relaxed)) ||
        !isAccessed(node))) {
     if (!isAccessed(node)) {
       markAccessed(node);
     }
 
-    auto func = [this, &node, curr]() {
-      reconfigureLocked(curr);
+    auto func = [this, &node, curr, shard]() {
+      auto lru = lru_[shard].get();
+      reconfigureLocked(shard, curr);
       ensureNotInsertionPoint(node);
       if (node.isInMMContainer()) {
-        lru_.moveToHead(node);
+        lru->list_.moveToHead(node);
         setUpdateTime(node, curr);
       }
       if (isTail(node)) {
         unmarkTail(node);
-        tailSize_--;
-        XDCHECK_LE(0u, tailSize_);
-        updateLruInsertionPoint();
+        lru->tailSize_--;
+        XDCHECK_LE(0u, lru->tailSize_);
+        updateLruInsertionPoint(shard);
       }
     };
 
@@ -79,7 +90,7 @@ bool MMLru::Container<T, HookPtr>::recordAccess(T& node,
     // if the tryLockUpdate optimization is off, we always execute the
     // critical section and return true
     if (config_.tryLockUpdate) {
-      if (auto lck = LockHolder{*lruMutex_, std::try_to_lock}) {
+      if (auto lck = LockHolder{*lru->lruMutex_, std::try_to_lock}) {
         func();
         return true;
       }
@@ -87,7 +98,7 @@ bool MMLru::Container<T, HookPtr>::recordAccess(T& node,
       return false;
     }
 
-    lruMutex_->lock_combine(func);
+    lru->lruMutex_->lock_combine(func);
     return true;
   }
   return false;
@@ -96,23 +107,30 @@ bool MMLru::Container<T, HookPtr>::recordAccess(T& node,
 template <typename T, MMLru::Hook<T> T::*HookPtr>
 cachelib::EvictionAgeStat MMLru::Container<T, HookPtr>::getEvictionAgeStat(
     uint64_t projectedLength) const noexcept {
-  return lruMutex_->lock_combine([this, projectedLength]() {
-    return getEvictionAgeStatLocked(projectedLength);
-  });
+  EvictionAgeStat totalStat{};
+  for (int shard = 0; shard < kShards; shard++) {
+    auto stat = lru_[shard].get()->lruMutex_->lock_combine([this, shard, projectedLength]() {
+      return getEvictionAgeStatLocked(shard, projectedLength);
+    });
+    totalStat.warmQueueStat += stat.warmQueueStat;
+  }
+  return totalStat;
 }
 
 template <typename T, MMLru::Hook<T> T::*HookPtr>
 cachelib::EvictionAgeStat
 MMLru::Container<T, HookPtr>::getEvictionAgeStatLocked(
+    int shard,
     uint64_t projectedLength) const noexcept {
   EvictionAgeStat stat{};
   const auto currTime = static_cast<Time>(util::getCurrentTimeSec());
 
-  const T* node = lru_.getTail();
+  auto lru = lru_[shard].get();
+  const T* node = lru->list_.getTail();
   stat.warmQueueStat.oldestElementAge =
       node ? currTime - getUpdateTime(*node) : 0;
   for (size_t numSeen = 0; numSeen < projectedLength && node != nullptr;
-       numSeen++, node = lru_.getPrev(*node)) {
+       numSeen++, node = lru->list_.getPrev(*node)) {
   }
   stat.warmQueueStat.projectedAge = node ? currTime - getUpdateTime(*node)
                                          : stat.warmQueueStat.oldestElementAge;
@@ -123,90 +141,104 @@ MMLru::Container<T, HookPtr>::getEvictionAgeStatLocked(
 
 template <typename T, MMLru::Hook<T> T::*HookPtr>
 void MMLru::Container<T, HookPtr>::setConfig(const Config& newConfig) {
-  lruMutex_->lock_combine([this, newConfig]() {
-    config_ = newConfig;
-    if (config_.lruInsertionPointSpec == 0 && insertionPoint_ != nullptr) {
-      auto curr = insertionPoint_;
-      while (tailSize_ != 0) {
+  config_ = newConfig;
+  for (int shard = 0; shard < kShards; shard++) {
+    lru_[shard].get()->lruMutex_->lock_combine([this, shard, newConfig]() {
+      setConfigLocked(shard, newConfig);
+    });
+  }
+}
+
+template <typename T, MMLru::Hook<T> T::*HookPtr>
+void MMLru::Container<T, HookPtr>::setConfigLocked(int shard, const Config& newConfig) {
+    auto lru = lru_[shard].get();
+    if (config_.lruInsertionPointSpec == 0 && lru->insertionPoint_ != nullptr) {
+      auto curr = lru->insertionPoint_;
+      while (lru->tailSize_ != 0) {
         XDCHECK(curr != nullptr);
         unmarkTail(*curr);
-        tailSize_--;
-        curr = lru_.getNext(*curr);
+        lru->tailSize_--;
+        curr = lru->list_.getNext(*curr);
       }
-      insertionPoint_ = nullptr;
+      lru->insertionPoint_ = nullptr;
     }
-    lruRefreshTime_.store(config_.lruRefreshTime, std::memory_order_relaxed);
-    nextReconfigureTime_ = config_.mmReconfigureIntervalSecs.count() == 0
+    lru->lruRefreshTime_.store(config_.lruRefreshTime, std::memory_order_relaxed);
+    lru->nextReconfigureTime_ = config_.mmReconfigureIntervalSecs.count() == 0
                                ? std::numeric_limits<Time>::max()
                                : static_cast<Time>(util::getCurrentTimeSec()) +
                                      config_.mmReconfigureIntervalSecs.count();
-  });
 }
 
 template <typename T, MMLru::Hook<T> T::*HookPtr>
 typename MMLru::Config MMLru::Container<T, HookPtr>::getConfig() const {
-  return lruMutex_->lock_combine([this]() { return config_; });
+  // todo: introduce config lock
+  return lru_[0].get()->lruMutex_->lock_combine([this]() { return config_; });
 }
 
 template <typename T, MMLru::Hook<T> T::*HookPtr>
-void MMLru::Container<T, HookPtr>::updateLruInsertionPoint() noexcept {
+void MMLru::Container<T, HookPtr>::updateLruInsertionPoint(int shard) noexcept {
   if (config_.lruInsertionPointSpec == 0) {
     return;
   }
 
+  auto lru = lru_[shard].get();
   // If insertionPoint_ is nullptr initialize it to tail first
-  if (insertionPoint_ == nullptr) {
-    insertionPoint_ = lru_.getTail();
-    tailSize_ = 0;
-    if (insertionPoint_ != nullptr) {
-      markTail(*insertionPoint_);
-      tailSize_++;
+  if (lru->insertionPoint_ == nullptr) {
+    lru->insertionPoint_ = lru->list_.getTail();
+    lru->tailSize_ = 0;
+    if (lru->insertionPoint_ != nullptr) {
+      prefetcher_.accessMMContainerUpdateInsertionPoint(lru->insertionPoint_);
+      markTail(*lru->insertionPoint_);
+      lru->tailSize_++;
     }
   }
 
-  if (lru_.size() <= 1) {
+  if (lru->list_.size() <= 1) {
     // we are done;
     return;
   }
 
   XDCHECK_NE(reinterpret_cast<uintptr_t>(nullptr),
-             reinterpret_cast<uintptr_t>(insertionPoint_));
+             reinterpret_cast<uintptr_t>(lru->insertionPoint_));
 
-  const auto expectedSize = lru_.size() >> config_.lruInsertionPointSpec;
-  auto curr = insertionPoint_;
+  const auto expectedSize = lru->list_.size() >> config_.lruInsertionPointSpec;
+  auto curr = lru->insertionPoint_;
 
-  while (tailSize_ < expectedSize && curr != lru_.getHead()) {
-    curr = lru_.getPrev(*curr);
+  while (lru->tailSize_ < expectedSize && curr != lru->list_.getHead()) {
+    curr = lru->list_.getPrev(*curr);
     markTail(*curr);
-    tailSize_++;
+    lru->tailSize_++;
   }
 
-  while (tailSize_ > expectedSize && curr != lru_.getTail()) {
+  while (lru->tailSize_ > expectedSize && curr != lru->list_.getTail()) {
     unmarkTail(*curr);
-    tailSize_--;
-    curr = lru_.getNext(*curr);
+    lru->tailSize_--;
+    curr = lru->list_.getNext(*curr);
   }
 
-  insertionPoint_ = curr;
+  lru->insertionPoint_ = curr;
 }
 
 template <typename T, MMLru::Hook<T> T::*HookPtr>
-bool MMLru::Container<T, HookPtr>::add(T& node) noexcept {
+bool MMLru::Container<T, HookPtr>::add(T& node, uint64_t hash) noexcept {
   const auto currTime = static_cast<Time>(util::getCurrentTimeSec());
+  const int shard = hash % kShards;
 
-  return lruMutex_->lock_combine([this, &node, currTime]() {
+  return lru_[shard].get()->lruMutex_->lock_combine([this, &node, currTime, shard]() {
     if (node.isInMMContainer()) {
       return false;
     }
-    if (config_.lruInsertionPointSpec == 0 || insertionPoint_ == nullptr) {
-      lru_.linkAtHead(node);
+    setShard(node, shard);
+    auto lru = lru_[shard].get();
+    if (config_.lruInsertionPointSpec == 0 || lru->insertionPoint_ == nullptr) {
+      lru->list_.linkAtHead(node);
     } else {
-      lru_.insertBefore(*insertionPoint_, node);
+      lru->list_.insertBefore(*lru->insertionPoint_, node);
     }
     node.markInMMContainer();
     setUpdateTime(node, currTime);
     unmarkAccessed(node);
-    updateLruInsertionPoint();
+    updateLruInsertionPoint(shard);
     return true;
   });
 }
@@ -214,18 +246,20 @@ bool MMLru::Container<T, HookPtr>::add(T& node) noexcept {
 template <typename T, MMLru::Hook<T> T::*HookPtr>
 typename MMLru::Container<T, HookPtr>::LockedIterator
 MMLru::Container<T, HookPtr>::getEvictionIterator() const noexcept {
-  LockHolder l(*lruMutex_);
-  return LockedIterator{std::move(l), lru_.rbegin()};
+  auto lru = lru_[folly::Random::rand32(0, kShards)].get();
+  LockHolder l(*lru->lruMutex_);
+  return LockedIterator{std::move(l), lru->list_.rbegin()};
 }
 
 template <typename T, MMLru::Hook<T> T::*HookPtr>
 template <typename F>
 void MMLru::Container<T, HookPtr>::withEvictionIterator(F&& fun) {
+  auto lru = lru_[folly::Random::rand32(0, kShards)].get();
   if (config_.useCombinedLockForIterators) {
-    lruMutex_->lock_combine([this, &fun]() { fun(Iterator{lru_.rbegin()}); });
+    lru->lruMutex_->lock_combine([this, &fun, lru]() { fun(Iterator{lru->list_.rbegin()}); });
   } else {
-    LockHolder lck{*lruMutex_};
-    fun(Iterator{lru_.rbegin()});
+    LockHolder lck{*lru->lruMutex_};
+    fun(Iterator{lru->list_.rbegin()});
   }
 }
 
@@ -233,34 +267,38 @@ template <typename T, MMLru::Hook<T> T::*HookPtr>
 void MMLru::Container<T, HookPtr>::ensureNotInsertionPoint(T& node) noexcept {
   // If we are removing the insertion point node, grow tail before we remove
   // so that insertionPoint_ is valid (or nullptr) after removal
-  if (&node == insertionPoint_) {
-    insertionPoint_ = lru_.getPrev(*insertionPoint_);
-    if (insertionPoint_ != nullptr) {
-      tailSize_++;
-      markTail(*insertionPoint_);
+  auto lru = lru_[getShard(node)].get();
+  if (&node == lru->insertionPoint_) {
+    lru->insertionPoint_ = lru->list_.getPrev(*lru->insertionPoint_);
+    if (lru->insertionPoint_ != nullptr) {
+      lru->tailSize_++;
+      markTail(*lru->insertionPoint_);
     } else {
-      XDCHECK_EQ(lru_.size(), 1u);
+      XDCHECK_EQ(lru->list_.size(), 1u);
     }
   }
 }
 
 template <typename T, MMLru::Hook<T> T::*HookPtr>
 void MMLru::Container<T, HookPtr>::removeLocked(T& node) {
+  int shard = getShard(node);
+  auto lru = lru_[shard].get();
   ensureNotInsertionPoint(node);
-  lru_.remove(node);
+  lru->list_.remove(node);
   unmarkAccessed(node);
   if (isTail(node)) {
     unmarkTail(node);
-    tailSize_--;
+    lru->tailSize_--;
   }
   node.unmarkInMMContainer();
-  updateLruInsertionPoint();
+  updateLruInsertionPoint(shard);
   return;
 }
 
 template <typename T, MMLru::Hook<T> T::*HookPtr>
 bool MMLru::Container<T, HookPtr>::remove(T& node) noexcept {
-  return lruMutex_->lock_combine([this, &node]() {
+  auto lru = lru_[getShard(node)].get();
+  return lru->lruMutex_->lock_combine([this, &node]() {
     if (!node.isInMMContainer()) {
       return false;
     }
@@ -279,12 +317,16 @@ void MMLru::Container<T, HookPtr>::remove(Iterator& it) noexcept {
 
 template <typename T, MMLru::Hook<T> T::*HookPtr>
 bool MMLru::Container<T, HookPtr>::replace(T& oldNode, T& newNode) noexcept {
-  return lruMutex_->lock_combine([this, &oldNode, &newNode]() {
+  const auto shard = getShard(oldNode);
+  auto lru = lru_[shard].get();
+  return lru->lruMutex_->lock_combine([this, &oldNode, &newNode, shard]() {
     if (!oldNode.isInMMContainer() || newNode.isInMMContainer()) {
       return false;
     }
+    auto lru = lru_[shard].get();
+    setShard(newNode, shard);
     const auto updateTime = getUpdateTime(oldNode);
-    lru_.replace(oldNode, newNode);
+    lru->list_.replace(oldNode, newNode);
     oldNode.unmarkInMMContainer();
     newNode.markInMMContainer();
     setUpdateTime(newNode, updateTime);
@@ -300,8 +342,8 @@ bool MMLru::Container<T, HookPtr>::replace(T& oldNode, T& newNode) noexcept {
     } else {
       unmarkTail(newNode);
     }
-    if (insertionPoint_ == &oldNode) {
-      insertionPoint_ = &newNode;
+    if (lru->insertionPoint_ == &oldNode) {
+      lru->insertionPoint_ = &newNode;
     }
     return true;
   });
@@ -312,7 +354,7 @@ serialization::MMLruObject MMLru::Container<T, HookPtr>::saveState()
     const noexcept {
   serialization::MMLruConfig configObject;
   *configObject.lruRefreshTime() =
-      lruRefreshTime_.load(std::memory_order_relaxed);
+      lru_[0].get()->lruRefreshTime_.load(std::memory_order_relaxed);
   *configObject.lruRefreshRatio() = config_.lruRefreshRatio;
   *configObject.updateOnWrite() = config_.updateOnWrite;
   *configObject.updateOnRead() = config_.updateOnRead;
@@ -321,17 +363,25 @@ serialization::MMLruObject MMLru::Container<T, HookPtr>::saveState()
 
   serialization::MMLruObject object;
   *object.config() = configObject;
-  *object.compressedInsertionPoint() =
-      compressor_.compress(insertionPoint_).saveState();
-  *object.tailSize() = tailSize_;
-  *object.lru() = lru_.saveState();
+
+  // todo: update serialization::MMLruObject
+  for (int shard = 0; shard < kShards; shard++) {
+    auto lru = lru_[shard].get();
+    *object.compressedInsertionPoint() =
+      compressor_.compress(lru->insertionPoint_).saveState();
+    *object.tailSize() = lru->tailSize_;
+    *object.lru() = lru->list_.saveState();
+  }
   return object;
 }
 
 template <typename T, MMLru::Hook<T> T::*HookPtr>
 MMContainerStat MMLru::Container<T, HookPtr>::getStats() const noexcept {
-  auto stat = lruMutex_->lock_combine([this]() {
-    auto* tail = lru_.getTail();
+  MMContainerStat stats{};
+  for (int shard = 0; shard < kShards; shard++) {
+    auto lru = lru_[shard].get();
+    auto stat = lru->lruMutex_->lock_combine([this, lru]() {
+      auto* tail = lru->list_.getTail();
 
     // we return by array here because DistributedMutex is fastest when the
     // output data fits within 48 bytes.  And the array is exactly 48 bytes, so
@@ -339,34 +389,33 @@ MMContainerStat MMLru::Container<T, HookPtr>::getStats() const noexcept {
     //
     // the rest of the parameters are 0, so we don't need the critical section
     // to return them
-    return folly::make_array(lru_.size(),
+      return folly::make_array(lru->list_.size(),
                              tail == nullptr ? 0 : getUpdateTime(*tail),
-                             lruRefreshTime_.load(std::memory_order_relaxed));
-  });
-  return {stat[0] /* lru size */,
-          stat[1] /* tail time */,
-          stat[2] /* refresh time */,
-          0,
-          0,
-          0,
-          0};
+                             lru->lruRefreshTime_.load(std::memory_order_relaxed));
+    });
+    stats.size += stat[0];
+    stats.oldestTimeSec = std::max(stats.oldestTimeSec, stat[1]);
+    stats.lruRefreshTime = !stats.lruRefreshTime ? stat[2] : std::min(stats.lruRefreshTime, stat[2]);
+  }
+  return stats;
 }
 
 template <typename T, MMLru::Hook<T> T::*HookPtr>
-void MMLru::Container<T, HookPtr>::reconfigureLocked(const Time& currTime) {
-  if (currTime < nextReconfigureTime_) {
+void MMLru::Container<T, HookPtr>::reconfigureLocked(int shard, const Time& currTime) {
+  auto lru = lru_[shard].get();
+  if (currTime < lru->nextReconfigureTime_) {
     return;
   }
-  nextReconfigureTime_ = currTime + config_.mmReconfigureIntervalSecs.count();
+  lru->nextReconfigureTime_ = currTime + config_.mmReconfigureIntervalSecs.count();
 
   // update LRU refresh time
-  auto stat = getEvictionAgeStatLocked(0);
+  auto stat = getEvictionAgeStatLocked(shard, 0);
   auto lruRefreshTime = std::min(
       std::max(config_.defaultLruRefreshTime,
                static_cast<uint32_t>(stat.warmQueueStat.oldestElementAge *
                                      config_.lruRefreshRatio)),
       kLruRefreshTimeCap);
-  lruRefreshTime_.store(lruRefreshTime, std::memory_order_relaxed);
+  lru->lruRefreshTime_.store(lruRefreshTime, std::memory_order_relaxed);
 }
 
 // Iterator Context Implementation

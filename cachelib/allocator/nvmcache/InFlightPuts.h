@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +26,8 @@
 #include <mutex>
 #include <utility>
 
+#include "cachelib/common/Mutex.h"
+
 namespace facebook {
 namespace cachelib {
 
@@ -33,8 +36,8 @@ namespace cachelib {
 // user guarantees that the lifetime of the token is within the lifetime of the
 // string piece with which they obtain the token.
 class alignas(folly::hardware_destructive_interference_size) InFlightPuts {
-  using LockGuard = std::lock_guard<std::mutex>;
-  using UniqueLock = std::unique_lock<std::mutex>;
+  using LockGuard = std::lock_guard<YieldableMutex>;
+  using UniqueLock = std::unique_lock<YieldableMutex>;
 
  public:
   class PutToken;
@@ -162,7 +165,7 @@ class alignas(folly::hardware_destructive_interference_size) InFlightPuts {
   folly::F14FastMap<folly::StringPiece, bool, folly::Hash> keys_;
 
   // mutex protecting the map.
-  std::mutex mutex_;
+  YieldableMutex mutex_;
 };
 
 } // namespace cachelib

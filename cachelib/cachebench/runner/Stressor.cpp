@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,6 +45,7 @@ ThroughputStats& ThroughputStats::operator+=(const ThroughputStats& other) {
   couldExistOp += other.couldExistOp;
   couldExistOpFalse += other.couldExistOpFalse;
   ops += other.ops;
+  yields += other.yields;
 
   return *this;
 }
@@ -84,6 +86,7 @@ void ThroughputStats::render(uint64_t elapsedTimeNs, std::ostream& out) const {
   out << folly::sformat("{:10}: {:.2f} million", "Total Ops", ops / 1e6)
       << std::endl;
   out << folly::sformat("{:10}: {:,}", "Total sets", set) << std::endl;
+  out << folly::sformat("{:10}: {:,}", "Yields", yields) << std::endl;
 
   auto outFn = [&out](folly::StringPiece k1, uint64_t v1, folly::StringPiece k2,
                       double v2) {
@@ -196,6 +199,9 @@ std::unique_ptr<Stressor> Stressor::makeStressor(
           cacheConfig, stressorConfig, std::move(generator));
     } else if (cacheConfig.allocator == "LRU2Q") {
       return std::make_unique<CacheStressor<Lru2QAllocator>>(
+          cacheConfig, stressorConfig, std::move(generator));
+    } else if (cacheConfig.allocator == "TINYLFU") {
+      return std::make_unique<CacheStressor<TinyLFUAllocator>>(
           cacheConfig, stressorConfig, std::move(generator));
     }
   }

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -276,6 +277,7 @@ class CacheProtoImpl final : public CacheProto {
       const DynamicRandomAPConfig& config) override {
     DynamicRandomAP::Config apConfig;
     apConfig.targetRate = config.getAdmWriteRate();
+    apConfig.bytesWrittenOffset = config.getBytesWrittenOffset();
     apConfig.fnBytesWritten = [device = config_.device.get()]() {
       return device->getBytesWritten();
     };

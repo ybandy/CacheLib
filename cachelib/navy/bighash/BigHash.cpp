@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -91,6 +92,7 @@ BigHash::BigHash(Config&& config, ValidConfigTag)
       bucketSize_{config.bucketSize},
       cacheBaseOffset_{config.cacheBaseOffset},
       numBuckets_{config.numBuckets()},
+      checksumData_{config.checksum},
       bloomFilter_{std::move(config.bloomFilter)},
       device_{*config.device} {
   XLOGF(INFO,
@@ -147,7 +149,7 @@ std::pair<Status, std::string> BigHash::getRandomAlloc(Buffer& value) {
   Bucket* bucket{nullptr};
   Buffer buffer;
   {
-    std::unique_lock<folly::SharedMutex> lock{getMutex(bid)};
+    std::unique_lock lock{getMutex(bid)};
     buffer = readBucket(bid);
     if (buffer.isNull()) {
       ioErrorCount_.inc();
@@ -294,7 +296,7 @@ Status BigHash::insert(HashedKey hk, BufferView value) {
       };
 
   {
-    std::unique_lock<folly::SharedMutex> lock{getMutex(bid)};
+    std::unique_lock lock{getMutex(bid)};
     auto buffer = readBucket(bid);
     if (buffer.isNull()) {
       ioErrorCount_.inc();
@@ -357,7 +359,7 @@ bool BigHash::couldExist(HashedKey hk) {
   const auto bid = getBucketId(hk);
   bool canExist;
   {
-    std::shared_lock<folly::SharedMutex> lock{getMutex(bid)};
+    std::shared_lock lock{getMutex(bid)};
     canExist = !bfReject(bid, hk.keyHash());
   }
 
@@ -380,7 +382,7 @@ Status BigHash::lookup(HashedKey hk, Buffer& value) {
   // bucket. Once the bucket is read, the buffer is local and we can find
   // without holding the lock.
   {
-    std::shared_lock<folly::SharedMutex> lock{getMutex(bid)};
+    std::shared_lock lock{getMutex(bid)};
 
     if (bfReject(bid, hk.keyHash())) {
       return Status::NotFound;
@@ -421,7 +423,7 @@ Status BigHash::remove(HashedKey hk) {
   };
 
   {
-    std::unique_lock<folly::SharedMutex> lock{getMutex(bid)};
+    std::unique_lock lock{getMutex(bid)};
     if (bfReject(bid, hk.keyHash())) {
       return Status::NotFound;
     }
@@ -512,6 +514,7 @@ Buffer BigHash::readBucket(BucketId bid) {
   auto* bucket = reinterpret_cast<Bucket*>(buffer.data());
 
   const auto checksumSuccess =
+      !checksumData_ ? true :
       Bucket::computeChecksum(buffer.view()) == bucket->getChecksum();
   // TODO (T93631284) we only read a bucket if the bloom filter indicates that
   // the bucket could have the element. Hence, if check sum errors out and bloom
@@ -534,7 +537,8 @@ Buffer BigHash::readBucket(BucketId bid) {
 
 bool BigHash::writeBucket(BucketId bid, Buffer buffer) {
   auto* bucket = reinterpret_cast<Bucket*>(buffer.data());
-  bucket->setChecksum(Bucket::computeChecksum(buffer.view()));
+  if (checksumData_)
+    bucket->setChecksum(Bucket::computeChecksum(buffer.view()));
   return device_.write(getBucketOffset(bid), std::move(buffer));
 }
 } // namespace navy

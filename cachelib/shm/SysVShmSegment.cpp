@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,6 +28,7 @@
 #include <cstring>
 
 #include "cachelib/common/Utils.h"
+#include "cachelib/allocator/memory/Slab.h"
 
 namespace facebook {
 namespace cachelib {
@@ -296,11 +298,22 @@ void* SysVShmSegment::mapAddress(void* addr) const {
 
 void SysVShmSegment::unMap(void* addr) const { detail::shmDtImpl(addr); }
 
+static void memConfig(void* addr, size_t size) {
+}
+
 void SysVShmSegment::memBind(void* addr) const {
   if (opts_.memBindNumaNodes.empty()) {
     return;
   }
-  detail::mbindImpl(addr, getSize(), MPOL_BIND, opts_.memBindNumaNodes, 0);
+  size_t headerSpace = sizeof(SlabHeader) * getSize() / sizeof(Slab);
+  headerSpace = (headerSpace + sizeof(Slab) - 1) / sizeof(Slab) * sizeof(Slab);
+  if (getSize() <= headerSpace) {
+    return;
+  }
+  detail::mbindImpl(addr + headerSpace, getSize() - headerSpace, MPOL_BIND, opts_.memBindNumaNodes, 0);
+  auto nodesMask = opts_.memBindNumaNodes.getNativeBitmask();
+  numa_interleave_memory(addr + headerSpace, getSize() - headerSpace, nodesMask);
+  memConfig(addr + headerSpace, getSize() - headerSpace);
 }
 
 void SysVShmSegment::markForRemoval() {

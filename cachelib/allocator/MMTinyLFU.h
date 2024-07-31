@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -66,6 +67,8 @@ class MMTinyLFU {
  public:
   // unique identifier per MMType
   static const int kId;
+
+  static constexpr size_t kShards = 1;
 
   // forward declaration;
   template <typename T>
@@ -281,17 +284,18 @@ class MMTinyLFU {
   struct Container {
    private:
     using LruList = MultiDList<T, HookPtr>;
-    using Mutex = folly::SpinLock;
+    using Mutex = YieldableSpinLock;
     using LockHolder = std::unique_lock<Mutex>;
     using PtrCompressor = typename T::PtrCompressor;
     using Time = typename Hook<T>::Time;
     using CompressedPtr = typename T::CompressedPtr;
     using RefFlags = typename T::Flags;
+    using Prefetcher = typename T::Prefetcher;
 
    public:
     Container() = default;
-    Container(Config c, PtrCompressor compressor)
-        : lru_(LruType::NumTypes, std::move(compressor)),
+    Container(Config c, PtrCompressor compressor, Prefetcher prefetcher)
+        : lru_(LruType::NumTypes, std::move(compressor), std::move(prefetcher)),
           config_(std::move(c)) {
       maybeGrowAccessCountersLocked();
       lruRefreshTime_ = config_.lruRefreshTime;
@@ -301,7 +305,7 @@ class MMTinyLFU {
               : static_cast<Time>(util::getCurrentTimeSec()) +
                     config_.mmReconfigureIntervalSecs.count();
     }
-    Container(serialization::MMTinyLFUObject object, PtrCompressor compressor);
+    Container(serialization::MMTinyLFUObject object, PtrCompressor compressor, Prefetcher prefetcher);
 
     Container(const Container&) = delete;
     Container& operator=(const Container&) = delete;
@@ -326,7 +330,7 @@ class MMTinyLFU {
     // @return  True if the node was successfully added to the container. False
     //          if the node was already in the contianer. On error state of node
     //          is unchanged.
-    bool add(T& node) noexcept;
+    bool add(T& node, uint64_t hash) noexcept;
 
     // removes the node from the lru and sets it previous and next to nullptr.
     //

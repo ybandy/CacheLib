@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,6 +41,7 @@
 #include "cachelib/common/EventInterface.h"
 #include "cachelib/common/Exceptions.h"
 #include "cachelib/common/Hash.h"
+#include "cachelib/common/Mutex.h"
 #include "cachelib/common/Utils.h"
 #include "cachelib/navy/common/Device.h"
 #include "folly/Range.h"
@@ -232,8 +234,8 @@ class NvmCache {
   // The lock ensures that the items in itemRemoved_ must exist in nvm, and nvm
   // eviction must erase item from itemRemoved_, so there won't memory leak or
   // influence to future item with same key.
-  std::unique_lock<std::mutex> getItemDestructorLock(HashedKey hk) const {
-    using LockType = std::unique_lock<std::mutex>;
+  std::unique_lock<YieldableMutex> getItemDestructorLock(HashedKey hk) const {
+    using LockType = std::unique_lock<YieldableMutex>;
     return itemDestructor_ ? LockType{itemDestructorMutex_[getShardForKey(hk)]}
                            : LockType{};
   }
@@ -414,11 +416,11 @@ class NvmCache {
     return getFillMapForShard(getShardForKey(hk));
   }
 
-  std::unique_lock<std::mutex> getFillLockForShard(size_t shard) {
-    return std::unique_lock<std::mutex>(fillLock_[shard].fillLock_);
+  std::unique_lock<YieldableMutex> getFillLockForShard(size_t shard) {
+    return std::unique_lock<YieldableMutex>(fillLock_[shard].fillLock_);
   }
 
-  std::unique_lock<std::mutex> getFillLock(HashedKey hk) {
+  std::unique_lock<YieldableMutex> getFillLock(HashedKey hk) {
     return getFillLockForShard(getShardForKey(hk));
   }
 
@@ -446,7 +448,7 @@ class NvmCache {
 
   // a map of fill locks for each shard
   struct {
-    alignas(folly::hardware_destructive_interference_size) std::mutex fillLock_;
+    alignas(folly::hardware_destructive_interference_size) YieldableMutex fillLock_;
   } fillLock_[kShards];
 
   // currently queued put operations to navy.
@@ -462,7 +464,7 @@ class NvmCache {
 
   const ItemDestructor itemDestructor_;
 
-  mutable std::array<std::mutex, kShards> itemDestructorMutex_;
+  mutable std::array<YieldableMutex, kShards> itemDestructorMutex_;
   // Used to track the keys of items present in NVM that should be excluded for
   // executing Destructor upon eviction from NVM, if the item is not present in
   // DRAM. The ownership of item destructor is already managed elsewhere for

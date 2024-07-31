@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -85,6 +86,7 @@ DynamicRandomAP::DynamicRandomAP(Config&& config, ValidConfigTag)
       maxChange_{1.0 + config.changeWindow},
       minChange_{1.0 - config.changeWindow},
       fnBytesWritten_{std::move(config.fnBytesWritten)},
+      bytesWrittenOffset_{config.bytesWrittenOffset},
       lowerBound_{config.probFactorLowerBound},
       upperBound_{config.probFactorUpperBound},
       fnBypass_{std::move(config.fnBypass)},
@@ -147,7 +149,7 @@ void DynamicRandomAP::reset() {
   params_.updateTime = startupTime_;
   params_.probabilityFactor = probabilitySeed_;
   writeStats_.curTargetRate = 0;
-  writeStats_.bytesWrittenLastUpdate = fnBytesWritten_();
+  writeStats_.bytesWrittenLastUpdate = getBytesWritten();
   writeStats_.bytesAcceptedLastUpdate = acceptedBytes_.get();
   writeStats_.bytesBypassedLastUpdate = bypassedBytes_.get();
 }
@@ -155,6 +157,12 @@ void DynamicRandomAP::reset() {
 void DynamicRandomAP::update() {
   std::unique_lock<folly::SharedMutex> lock{mutex_};
   updateThrottleParamsLocked(getSteadyClockSeconds());
+}
+
+uint64_t DynamicRandomAP::getBytesWritten() {
+  auto bytesWritten = fnBytesWritten_();
+
+  return (bytesWritten < bytesWrittenOffset_) ? 0 : (bytesWritten - bytesWrittenOffset_);
 }
 
 void DynamicRandomAP::updateThrottleParamsLocked(std::chrono::seconds curTime) {
@@ -168,7 +176,7 @@ void DynamicRandomAP::updateThrottleParamsLocked(std::chrono::seconds curTime) {
   }
 
   params_.updateTime = curTime;
-  auto bytesWritten = fnBytesWritten_();
+  auto bytesWritten = getBytesWritten();
   auto bytesWrittenDiff = bytesWritten - writeStats_.bytesWrittenLastUpdate;
   writeStats_.observedCurRate = bytesWrittenDiff / updateTimeDelta;
   // There is no bytes observed from device, skip this update.
@@ -179,7 +187,10 @@ void DynamicRandomAP::updateThrottleParamsLocked(std::chrono::seconds curTime) {
   auto secondsElapsed = (curTime - startupTime_).count();
   auto targetWrittenTomorrow = targetRate_ * (secondsElapsed + kSecondsInDay);
   uint64_t curTargetRate{0};
-  if (bytesWritten < targetWrittenTomorrow) {
+  if (bytesWrittenOffset_) {
+    // Ignore the total bytes written in the past
+    curTargetRate = targetRate_;
+  } else if (bytesWritten < targetWrittenTomorrow) {
     // Write rate needed to achieve @targetWrittenTomorrow given that we have
     // currently written @bytesWritten.
     curTargetRate = (targetWrittenTomorrow - bytesWritten) / kSecondsInDay;

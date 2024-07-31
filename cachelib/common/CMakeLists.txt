@@ -1,4 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# Copyright (c) 2024 Kioxia Corporation.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,6 +22,7 @@ add_library (cachelib_common
   CountDownLatch.cpp
   ${BLOOM_THRIFT_FILES}
   hothash/HotHashDetector.cpp
+  Mutex.cpp
   PercentileStats.cpp
   PeriodicWorker.cpp
   piecewise/GenericPieces.cpp

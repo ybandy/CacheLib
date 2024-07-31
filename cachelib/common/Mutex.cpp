@@ -1,5 +1,4 @@
 /*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
  * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,12 +14,8 @@
  * limitations under the License.
  */
 
-namespace cpp2 facebook.cachelib.objcache.serialization
+#include "cachelib/common/Mutex.h"
 
-struct Item {
-  1: i16 poolId;
-  2: i32 creationTime;
-  3: i32 expiryTime;
-  4: string key;
-  5: string payload;
-}
+folly::ThreadLocal<std::unordered_map<void*, facebook::cachelib::MutexStat>, facebook::cachelib::MutexStats::DummyMutexStatsTag> facebook::cachelib::MutexStats::tlStats;
+std::unordered_map<void*, facebook::cachelib::MutexStat> facebook::cachelib::MutexStats::allStats;
+std::mutex facebook::cachelib::MutexStats::mutex;

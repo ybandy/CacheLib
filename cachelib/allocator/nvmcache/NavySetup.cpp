@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -302,6 +303,10 @@ std::unique_ptr<cachelib::navy::JobScheduler> createJobScheduler(
   auto readerThreads = config.getReaderThreads();
   auto writerThreads = config.getWriterThreads();
   auto reqOrderShardsPower = config.getNavyReqOrderingShards();
+  if (config.getNavyTryBlocking()) {
+    return cachelib::navy::createTryBlockingJobScheduler(
+      readerThreads, writerThreads, reqOrderShardsPower);
+  }
   return cachelib::navy::createOrderedThreadPoolJobScheduler(
       readerThreads, writerThreads, reqOrderShardsPower);
 }

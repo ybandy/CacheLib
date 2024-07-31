@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,6 +27,7 @@ void SList<T, HookPtr>::insert(T& node) noexcept {
   XDCHECK_EQ(size_ == 0, head_ == nullptr);
   XDCHECK_EQ(size_ == 0, tail_ == nullptr);
 
+  prefetcher_.accessFreeListPush(&node);
   // Set next to the current head
   setNext(node, head_);
 
@@ -44,6 +46,7 @@ void SList<T, HookPtr>::pop() {
   }
 
   // Store a reference to the current head
+  prefetcher_.accessFreeListPop(head_);
   T& node = *head_;
 
   // Set new head

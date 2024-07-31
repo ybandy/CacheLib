@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -116,7 +117,7 @@ void Allocator::flushAndReleaseRegionFromRALocked(RegionAllocator& ra,
 
 void Allocator::flush() {
   for (auto& ra : allocators_) {
-    std::lock_guard<std::mutex> lock{ra.getLock()};
+    LockGuard lock{ra.getLock()};
     flushAndReleaseRegionFromRALocked(ra, false /* async */);
   }
 }
@@ -124,7 +125,7 @@ void Allocator::flush() {
 void Allocator::reset() {
   regionManager_.reset();
   for (auto& ra : allocators_) {
-    std::lock_guard<std::mutex> lock{ra.getLock()};
+    LockGuard lock{ra.getLock()};
     ra.reset();
   }
 }

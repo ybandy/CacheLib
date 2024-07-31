@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -43,13 +44,14 @@ class MultiDList {
   using SingleDList = DList<T, HookPtr>;
   using DListIterator = typename SingleDList::Iterator;
   using MultiDListObject = serialization::MultiDListObject;
+  using Prefetcher = typename T::Prefetcher;
 
   MultiDList(const MultiDList&) = delete;
   MultiDList& operator=(const MultiDList&) = delete;
 
-  MultiDList(unsigned int numLists, PtrCompressor compressor) noexcept {
+  MultiDList(unsigned int numLists, PtrCompressor compressor, Prefetcher prefetcher) noexcept {
     for (unsigned int i = 0; i < numLists; i++) {
-      lists_.emplace_back(std::make_unique<SingleDList>(compressor));
+      lists_.emplace_back(std::make_unique<SingleDList>(compressor, prefetcher));
     }
   }
 
@@ -57,9 +59,9 @@ class MultiDList {
   //
   // @param object              saved MultiDList object
   // @param compressor          PtrCompressor object
-  MultiDList(const MultiDListObject& object, PtrCompressor compressor) {
+  MultiDList(const MultiDListObject& object, PtrCompressor compressor, Prefetcher prefetcher) {
     for (const auto& list : *object.lists()) {
-      lists_.emplace_back(std::make_unique<SingleDList>(list, compressor));
+      lists_.emplace_back(std::make_unique<SingleDList>(list, compressor, prefetcher));
     }
   }
 
@@ -86,13 +88,13 @@ class MultiDList {
     return sz;
   }
 
-  void insertEmptyListAt(size_t pos, PtrCompressor compressor) {
+  void insertEmptyListAt(size_t pos, PtrCompressor compressor, Prefetcher prefetcher) {
     if (pos > lists_.size()) {
       throw std::invalid_argument(
           "Invalid position to insert empty list to MultiDList");
     }
     lists_.insert(lists_.begin() + pos,
-                  std::make_unique<SingleDList>(compressor));
+                  std::make_unique<SingleDList>(compressor, prefetcher));
   }
 
   // Iterator interface for the double linked list. Supports both iterating

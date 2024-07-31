@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -57,6 +58,7 @@ class TraceFileStream {
                   int64_t id,
                   const ColumnTable& columnTable)
       : configPath_(config.configPath),
+        config_(config),
         repeatTraceReplay_(config.repeatTraceReplay) {
     idStr_ = folly::sformat("[{}]", id);
     if (!config.traceFileName.empty()) {

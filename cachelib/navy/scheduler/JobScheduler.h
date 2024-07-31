@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -74,6 +75,11 @@ class JobScheduler {
 // create a thread pool job scheduler that ensures ordering of requests by
 // key. This is the default job scheduler for use in Navy.
 std::unique_ptr<JobScheduler> createOrderedThreadPoolJobScheduler(
+    uint32_t readerThreads,
+    uint32_t writerThreads,
+    uint32_t reqOrderShardPower);
+
+std::unique_ptr<JobScheduler> createTryBlockingJobScheduler(
     uint32_t readerThreads,
     uint32_t writerThreads,
     uint32_t reqOrderShardPower);

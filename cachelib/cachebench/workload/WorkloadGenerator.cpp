@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,7 +45,7 @@ WorkloadGenerator::WorkloadGenerator(const StressorConfig& config)
   generateKeyDistributions();
 }
 
-const Request& WorkloadGenerator::getReq(uint8_t poolId,
+const Request& WorkloadGenerator::getReq(uint16_t poolId,
                                          std::mt19937_64& gen,
                                          std::optional<uint64_t>) {
   XDCHECK_LT(poolId, keyIndicesForPool_.size());
@@ -54,11 +55,125 @@ const Request& WorkloadGenerator::getReq(uint8_t poolId,
   auto op =
       static_cast<OpType>(workloadDist_[workloadIdx(poolId)].sampleOpDist(gen));
   reqs_[idx].setOp(op);
+  if (enableRenderDist_)
+    reqs_[idx].counter++;
   return reqs_[idx];
 }
 
+void WorkloadGenerator::renderDistribution(std::ostream& out) const {
+  if (!enableRenderDist_)
+    return;
+
+  std::vector<uint64_t> hits;
+  uint64_t total_hits = 0;
+  for (auto& req: reqs_) {
+    if (req.counter)
+      hits.push_back(req.counter);
+    total_hits += req.counter;
+  }
+  std::sort(hits.begin(), hits.end(), [](uint64_t a, uint64_t b) {
+    return a > b;
+  });
+
+  /* fio/t/genzipf.c */
+#define DEF_NR_OUTPUT   20
+  unsigned long block_size = 4096;
+  unsigned long output_nranges = DEF_NR_OUTPUT;
+  double percentage = 0;
+
+  struct output_sum {
+    double output;
+    unsigned int nranges;
+  };
+
+  unsigned long nnodes = hits.size();
+  unsigned long nranges = total_hits;
+
+  unsigned long i, j, cur_vals, interval_step, next_interval, total_vals;
+  unsigned long blocks = percentage * nnodes / 100;
+  double hit_percent_sum = 0;
+  unsigned long long hit_sum = 0;
+  double perc, perc_i;
+  struct output_sum *output_sums;
+
+  interval_step = (nnodes - 1) / output_nranges + 1;
+  next_interval = interval_step;
+  output_sums = new output_sum[output_nranges];
+
+  for (i = 0; i < output_nranges; i++) {
+    output_sums[i].output = 0.0;
+    output_sums[i].nranges = 0;
+  }
+
+  j = total_vals = cur_vals = 0;
+
+  for (i = 0; i < nnodes; i++) {
+    struct output_sum *os = &output_sums[j];
+    cur_vals += hits[i];
+    total_vals += hits[i];
+    os->nranges += hits[i];
+    if (i == (next_interval) -1 || i == nnodes - 1) {
+      os->output = (double) cur_vals / (double) nranges;
+      os->output *= 100.0;
+      cur_vals = 0;
+      next_interval += interval_step;
+      j++;
+    }
+
+    if (percentage) {
+      if (total_vals >= blocks) {
+        double cs = (double) i * block_size / (1024.0 * 1024.0);
+        char p = 'M';
+
+        if (cs > 1024.0) {
+          cs /= 1024.0;
+          p = 'G';
+        }
+        if (cs > 1024.0) {
+          cs /= 1024.0;
+          p = 'T';
+        }
+
+        out << folly::sformat("{:.2f}% of hits satisfied in {:.3f}{}B of cache", percentage, cs, p) << std::endl;
+        percentage = 0.0;
+      }
+    }
+  }
+
+  perc_i = 100.0 / (double)output_nranges;
+  perc = 0.0;
+
+  out << std::endl << "   Rows           Hits %         Sum %           # Hits          Size" << std::endl;
+  out << "-----------------------------------------------------------------------" << std::endl;
+  for (i = 0; i < output_nranges; i++) {
+    struct output_sum *os = &output_sums[i];
+    double gb = (double)os->nranges * block_size / 1024.0;
+    char p = 'K';
+
+    if (gb > 1024.0) {
+      p = 'M';
+      gb /= 1024.0;
+    }
+    if (gb > 1024.0) {
+      p = 'G';
+      gb /= 1024.0;
+    }
+
+    perc += perc_i;
+    hit_percent_sum += os->output;
+    hit_sum += os->nranges;
+    out << folly::sformat("{} {:6.2f}%\t{:6.2f}%\t\t{:6.2f}%\t\t{:8}\t{:6.2f}{}",
+      i ? "|->" : "Top", perc, os->output, hit_percent_sum,
+      os->nranges, gb, p) << std::endl;
+  }
+
+  out << "-----------------------------------------------------------------------" << std::endl;
+  out << folly::sformat("Total\t\t\t\t\t\t{:8}", hit_sum) << std::endl;
+  delete output_sums;
+}
+
 void WorkloadGenerator::generateKeys() {
-  uint8_t pid = 0;
+  uint16_t pid = 0;
   auto fn = [pid, this](size_t start, size_t end) {
     // All keys are printable lower case english alphabet.
     std::uniform_int_distribution<char> charDis('a', 'z');
@@ -77,7 +192,7 @@ void WorkloadGenerator::generateKeys() {
   std::chrono::seconds keyGenDuration(0);
   keys_.resize(config_.numKeys);
   for (size_t i = 0; i < config_.keyPoolDistribution.size(); i++) {
-    pid = util::narrow_cast<uint8_t>(workloadIdx(i));
+    pid = util::narrow_cast<uint16_t>(workloadIdx(i));
     size_t numKeysForPool =
         firstKeyIndexForPool_[i + 1] - firstKeyIndexForPool_[i];
     totalKeys += numKeysForPool;

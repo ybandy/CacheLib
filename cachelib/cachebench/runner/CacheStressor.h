@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,6 +37,11 @@
 #include "cachelib/cachebench/util/Parallel.h"
 #include "cachelib/cachebench/util/Request.h"
 #include "cachelib/cachebench/workload/GeneratorBase.h"
+
+#include <folly/fibers/AddTasks.h>
+#include <folly/fibers/FiberManager.h>
+#include <folly/fibers/FiberManagerMap.h>
+#include <folly/io/async/EventBase.h>
 
 namespace facebook {
 namespace cachelib {
@@ -149,10 +155,47 @@ class CacheStressor : public Stressor {
 
       for (uint64_t i = 0; i < config_.numThreads; ++i) {
         workers.push_back(
-            std::thread([this, throughputStats = &throughputStats_.at(i),
+            std::thread([this, i, throughputStats = &throughputStats_.at(i),
                          threadName = folly::sformat("cb_stressor_{}", i)]() {
               folly::setThreadName(threadName);
-              stressByDiscreteDistribution(*throughputStats);
+              if (config_.affinitizeThreads) {
+                cpu_set_t cpuset;
+                CPU_ZERO(&cpuset);
+                CPU_SET(i, &cpuset);
+                pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+              }
+
+              if (config_.numFibers == 0) {
+                stressByDiscreteDistribution(*throughputStats);
+              } else {
+                folly::EventBase evb;
+                folly::fibers::FiberManager::Options opts;
+                opts.stackSize = 128 * 1024;
+                auto& fiberManager = folly::fibers::getFiberManager(evb, folly::fibers::FiberManager::FrozenOptions{opts});
+                std::vector<folly::fibers::Baton> batons(config_.numFibers);
+
+                for (uint64_t j = 0; j < config_.numFibers; ++j) {
+                  fiberManager.addTask([this, i, j, &batons, throughputStats] {
+                    std::cout << "Task " << i << ", " << j << ": start" << std::endl;
+                    stressByDiscreteDistribution(*throughputStats);
+                    std::cout << "Task " << i << ", " << j << ": before baton.post()" << std::endl;
+                    batons[j].post();
+                    std::cout << "Task " << i << ", " << j << ": after baton.post()" << std::endl;
+                  });
+                }
+
+                evb.loop();
+
+                for (uint64_t j = 0; j < config_.numFibers; ++j) {
+                  std::cout << "Main " << i << ", " << j << ": baton.wait()" << std::endl;
+                  batons[j].wait();
+                }
+                //throughputStats->yields += fiberManager.numYields();
+
+                evb.loop();
+              }
+              facebook::cachelib::MutexStats::flush();
+              facebook::cachelib::PrefetchStats::flush();
             }));
       }
       for (auto& worker : workers) {
@@ -208,6 +251,7 @@ class CacheStressor : public Stressor {
   void renderWorkloadGeneratorStats(uint64_t elapsedTimeNs,
                                     std::ostream& out) const override {
     wg_->renderStats(elapsedTimeNs, out);
+    wg_->renderDistribution(out);
   }
 
   void renderWorkloadGeneratorStats(
@@ -294,7 +338,7 @@ class CacheStressor : public Stressor {
 
     std::optional<uint64_t> lastRequestId = std::nullopt;
     for (uint64_t i = 0;
-         i < config_.numOps &&
+         i < config_.numOps / std::max(config_.numFibers, 1UL) &&
          cache_->getInconsistencyCount() < config_.maxInconsistencyCount &&
          cache_->getInvalidDestructorCount() <
              config_.maxInvalidDestructorCount &&
@@ -321,7 +365,9 @@ class CacheStressor : public Stressor {
         const auto pid = static_cast<PoolId>(opPoolDist(gen));
         const Request& req(getReq(pid, gen, lastRequestId));
         OpType op = req.getOp();
-        const std::string* key = &(req.key);
+        // OnlineGenerator returns the thread-local requests that folly;;fibers cannot share
+        const std::string k = std::string(req.key);
+        const std::string* key = &k;
         std::string oneHitKey;
         if (op == OpType::kLoneGet || op == OpType::kLoneSet) {
           oneHitKey = Request::getUniqueKey();
@@ -339,8 +385,10 @@ class CacheStressor : public Stressor {
             }
           }
           auto lock = chainedItemAcquireUniqueLock(*key);
+          facebook::cachelib::CheckpointTracer::record(kSetOpBegin);
           result = setKey(pid, stats, key, *(req.sizeBegin), req.ttlSecs,
                           req.admFeatureMap, req.itemValue);
+          facebook::cachelib::CheckpointTracer::record(kSetOpEnd);
 
           break;
         }
@@ -357,8 +405,10 @@ class CacheStressor : public Stressor {
           // TODO currently pure lookaside, we should
           // add a distribution over sequences of requests/access patterns
           // e.g. get-no-set and set-no-get
+          facebook::cachelib::CheckpointTracer::record(kGetOpBegin);
           cache_->recordAccess(*key);
           auto it = cache_->find(*key);
+          facebook::cachelib::CheckpointTracer::record(kGetOpEnd);
           if (it == nullptr) {
             ++stats.getMiss;
             result = OpResultType::kGetMiss;
@@ -369,8 +419,10 @@ class CacheStressor : public Stressor {
               // appropriate here)
               slock = {};
               xlock = chainedItemAcquireUniqueLock(*key);
+              facebook::cachelib::CheckpointTracer::record(kSetOpBegin);
               setKey(pid, stats, key, *(req.sizeBegin), req.ttlSecs,
                      req.admFeatureMap, req.itemValue);
+              facebook::cachelib::CheckpointTracer::record(kSetOpEnd);
             }
           } else {
             result = OpResultType::kGetHit;
@@ -381,7 +433,9 @@ class CacheStressor : public Stressor {
         case OpType::kDel: {
           ++stats.del;
           auto lock = chainedItemAcquireUniqueLock(*key);
+          facebook::cachelib::CheckpointTracer::record(kDelOpBegin);
           auto res = cache_->remove(*key);
+          facebook::cachelib::CheckpointTracer::record(kDelOpEnd);
           if (res == CacheT::RemoveRes::kNotFoundInRam) {
             ++stats.delNotFound;
           }
@@ -459,6 +513,9 @@ class CacheStressor : public Stressor {
         }
       } catch (const cachebench::EndOfTrace& ex) {
         break;
+      }
+      if (config_.yieldPerOps != 0 && (i % config_.yieldPerOps) == 0) {
+        folly::fibers::yield();
       }
     }
     wg_->markFinish();

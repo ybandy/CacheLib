@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +23,7 @@
 #include <folly/synchronization/SanitizeThread.h>
 #include <sys/mman.h>
 #include <sys/types.h>
+#include <valgrind/memcheck.h>
 
 #include <chrono>
 #include <memory>
@@ -122,6 +124,7 @@ SlabAllocator::SlabAllocator(void* memoryStart,
       memorySize_(roundDownToSlabSize(memorySize)),
       slabMemoryStart_(computeSlabMemoryStart(memoryStart_, memorySize_)),
       nextSlabAllocation_(slabMemoryStart_),
+      prefetchDelayNSec_(config.prefetchDelayNSec),
       ownsMemory_(ownsMemory) {
   checkState();
 
@@ -141,6 +144,11 @@ SlabAllocator::SlabAllocator(void* memoryStart,
   XDCHECK(nextSlabAllocation_ != nullptr);
   XDCHECK_EQ(reinterpret_cast<uintptr_t>(nextSlabAllocation_),
              reinterpret_cast<uintptr_t>(slabMemoryStart_));
+
+#define MAKE_MEM_NOACCESS(addr, size) VALGRIND_MAKE_MEM_NOACCESS(addr, size)
+
+  (void) MAKE_MEM_NOACCESS(slabMemoryStart_,
+    reinterpret_cast<uintptr_t>(getSlabMemoryEnd()) - reinterpret_cast<uintptr_t>(slabMemoryStart_));
 }
 
 SlabAllocator::SlabAllocator(const serialization::SlabAllocatorObject& object,

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,6 +46,8 @@ Cache<Allocator>::Cache(const CacheConfig& config,
   allocatorConfig_.enablePoolRebalancing(
       config_.getRebalanceStrategy(),
       std::chrono::seconds(config_.poolRebalanceIntervalSec));
+
+  allocatorConfig_.setPrefetchDelayNSec(config_.prefetchDelayNSec);
 
   if (config_.moveOnSlabRelease && movingSync != nullptr) {
     allocatorConfig_.enableMovingOnSlabRelease(
@@ -113,6 +116,10 @@ Cache<Allocator>::Cache(const CacheConfig& config,
   } else if (config_.enableItemDestructor) {
     auto removeCB = [&](const typename Allocator::DestructorData&) {};
     allocatorConfig_.setItemDestructor(removeCB);
+  }
+
+  if (config_.disableItemReaper) {
+    allocatorConfig_.enableItemReaperInBackground(std::chrono::seconds{0});
   }
 
   // Set up Navy
@@ -215,9 +222,13 @@ Cache<Allocator>::Cache(const CacheConfig& config,
     nvmConfig.navyConfig.setReaderAndWriterThreads(config_.navyReaderThreads,
                                                    config_.navyWriterThreads);
 
+    nvmConfig.navyConfig.setNavyTryBlocking(config_.navyTryBlocking);
+
     if (config_.navyAdmissionWriteRateMB > 0) {
       nvmConfig.navyConfig.enableDynamicRandomAdmPolicy().setAdmWriteRate(
-          config_.navyAdmissionWriteRateMB * MB);
+          config_.navyAdmissionWriteRateMB * MB).setMaxWriteRate(
+          config_.navyMaxWriteRateMB * MB).setBytesWrittenOffset(
+          config_.navyBytesWrittenOffsetGB * 1024ULL * MB);
     }
     nvmConfig.navyConfig.setMaxConcurrentInserts(
         config_.navyMaxConcurrentInserts);
@@ -388,7 +399,9 @@ typename Cache<Allocator>::WriteHandle Cache<Allocator>::allocateChainedItem(
     const ReadHandle& parent, size_t size) {
   auto handle = cache_->allocateChainedItem(parent, CacheValue::getSize(size));
   if (handle) {
-    CacheValue::initialize(handle->getMemory());
+    auto mem = handle->getMemory();
+    cache_->prefetchWrite(mem);
+    CacheValue::initialize(mem);
   }
   return handle;
 }
@@ -422,6 +435,7 @@ typename Cache<Allocator>::WriteHandle Cache<Allocator>::allocate(
   try {
     handle = cache_->allocate(pid, key, CacheValue::getSize(size), ttlSecs);
     if (handle) {
+      cache_->prefetchWrite(handle->getMemory(), CacheValue::getSize(size));
       CacheValue::initialize(handle->getMemory());
     }
   } catch (const std::invalid_argument& e) {
@@ -456,6 +470,7 @@ void Cache<Allocator>::touchValue(const ReadHandle& it) const {
 
   auto ptr = reinterpret_cast<const uint8_t*>(getMemory(it));
 
+  cache_->prefetchRead(ptr, getSize(it));
   /* The accumulate call is intended to access all bytes of the value
    * and nothing more. */
   auto sum = std::accumulate(ptr, ptr + getSize(it), 0ULL);

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -67,6 +68,7 @@
 #include "cachelib/allocator/Util.h"
 #include "cachelib/allocator/memory/MemoryAllocator.h"
 #include "cachelib/allocator/memory/MemoryAllocatorStats.h"
+#include "cachelib/allocator/memory/Prefetcher.h"
 #include "cachelib/allocator/memory/serialize/gen-cpp2/objects_types.h"
 #include "cachelib/allocator/nvmcache/NvmCache.h"
 #include "cachelib/allocator/serialize/gen-cpp2/objects_types.h"
@@ -104,6 +106,23 @@ namespace tests {
 class CacheTest;
 }
 } // namespace cachebench
+
+class CheckpointTraceDumper : public PeriodicWorker {
+ public:
+  CheckpointTraceDumper(CacheBase& cache, const std::string& cacheDir) : cache_(cache), cacheDir_(cacheDir) {}
+  ~CheckpointTraceDumper() override { stop(std::chrono::seconds(0)); }
+
+ private:
+  CacheBase& cache_;
+  const std::string cacheDir_;
+  void work() final {
+    std::ofstream f(cacheDir_ + "/CheckpointTraceDump", std::ios::trunc);
+    CheckpointTracer::dump(f);
+    f.flush();
+    f.close();
+    CheckpointTracer::reset();
+  }
+};
 
 namespace tests {
 template <typename AllocatorT>
@@ -1054,6 +1073,8 @@ class CacheAllocator : public CacheBase {
   bool startNewReaper(std::chrono::milliseconds interval,
                       util::Throttler::Config reaperThrottleConfig);
 
+  bool startNewCheckpointTraceDumper(std::chrono::milliseconds interval);
+
   // Stop existing workers with a timeout
   bool stopPoolRebalancer(std::chrono::seconds timeout = std::chrono::seconds{
                               0});
@@ -1062,6 +1083,7 @@ class CacheAllocator : public CacheBase {
                              0});
   bool stopMemMonitor(std::chrono::seconds timeout = std::chrono::seconds{0});
   bool stopReaper(std::chrono::seconds timeout = std::chrono::seconds{0});
+  bool stopCheckpointTraceDumper(std::chrono::seconds timeout = std::chrono::seconds{0});
 
   // Set pool optimization to either true or false
   //
@@ -1284,6 +1306,13 @@ class CacheAllocator : public CacheBase {
   // gives a relative offset to a pointer within the cache.
   uint64_t getItemPtrAsOffset(const void* ptr);
 
+  void prefetchRead(const void* ptr, size_t len = 64) {
+    prefetcher_.accessReadValue(ptr, len);
+  }
+  void prefetchWrite(const void* ptr, size_t len = 64) {
+    prefetcher_.accessWriteValue(ptr, len);
+  }
+
   // this ensures that we dont introduce any more hidden fields like vtable by
   // inheriting from the Hooks and their bool interface.
   static_assert((sizeof(typename MMType::template Hook<Item>) +
@@ -1291,7 +1320,7 @@ class CacheAllocator : public CacheBase {
                  sizeof(typename RefcountWithFlags::Value) + sizeof(uint32_t) +
                  sizeof(uint32_t) + sizeof(KAllocation)) == sizeof(Item),
                 "vtable overhead");
-  static_assert(32 == sizeof(Item), "item overhead is 32 bytes");
+  static_assert(36 == sizeof(Item), "item overhead is 36 bytes");
 
   // make sure there is no overhead in ChainedItem on top of a regular Item
   static_assert(sizeof(Item) == sizeof(ChainedItem),
@@ -1594,6 +1623,7 @@ class CacheAllocator : public CacheBase {
   //
   // @throw std::runtime_error if the handle is already in the mm container
   void insertInMMContainer(Item& item);
+  void insertInMMContainer(Item& item, HashedKey hk);
 
   // Removes an item from the corresponding MMContainer if it is in the
   // container. The caller must hold a valid handle for the item.
@@ -1704,7 +1734,7 @@ class CacheAllocator : public CacheBase {
 
   MMContainers deserializeMMContainers(
       Deserializer& deserializer,
-      const typename Item::PtrCompressor& compressor);
+      const typename Item::PtrCompressor& compressor, const typename Item::Prefetcher& prefetcher);
 
   unsigned int reclaimSlabs(PoolId id, size_t numSlabs) final {
     return allocator_->reclaimSlabsAndGrow(id, numSlabs);
@@ -1866,7 +1896,7 @@ class CacheAllocator : public CacheBase {
                   config.reduceFragmentationInAllocationClass)
             : config.defaultAllocSizes,
         config.enableZeroedSlabAllocs, config.disableFullCoredump,
-        config.lockMemory};
+        config.lockMemory, config.prefetchDelayNSec};
   }
 
   // starts one of the cache workers passing the current instance and the args
@@ -1906,6 +1936,10 @@ class CacheAllocator : public CacheBase {
 
   typename Item::PtrCompressor createPtrCompressor() const {
     return allocator_->createPtrCompressor<Item>();
+  }
+
+  typename Item::Prefetcher createPrefetcher() const {
+    return allocator_->createPrefetcher();
   }
 
   // helper utility to throttle and optionally log.
@@ -2035,6 +2069,8 @@ class CacheAllocator : public CacheBase {
   // ptr compressor
   typename Item::PtrCompressor compressor_;
 
+  typename Item::Prefetcher prefetcher_;
+
   // Lock to synchronize addition of a new pool and its resizing/rebalancing
   folly::SharedMutex poolsResizeAndRebalanceLock_;
 
@@ -2069,6 +2105,8 @@ class CacheAllocator : public CacheBase {
 
   // free memory monitor
   std::unique_ptr<MemoryMonitor> memMonitor_;
+
+  std::unique_ptr<CheckpointTraceDumper> checkpointTraceDumper_;
 
   // check whether a pool is a slabs pool
   std::array<bool, MemoryPoolManager::kMaxPools> isCompactCachePool_{};

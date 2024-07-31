@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +25,7 @@
 #include <vector>
 
 #include "cachelib/common/AtomicCounter.h"
+#include "cachelib/common/Mutex.h"
 #include "cachelib/navy/block_cache/RegionManager.h"
 #include "cachelib/navy/common/Buffer.h"
 #include "cachelib/navy/common/Types.h"
@@ -58,7 +60,7 @@ class RegionAllocator {
   uint16_t priority() const { return priority_; }
 
   // Returns the mutex lock.
-  std::mutex& getLock() const { return mutex_; }
+  YieldableMutex& getLock() const { return mutex_; }
 
  private:
   const uint16_t priority_{};
@@ -66,7 +68,7 @@ class RegionAllocator {
   // The current region id from which we are allocating
   RegionId rid_;
 
-  mutable std::mutex mutex_;
+  mutable YieldableMutex mutex_;
 };
 
 // Size class or stack allocator. Thread safe. Syncs access
@@ -112,7 +114,7 @@ class Allocator {
   void getCounters(const CounterVisitor& visitor) const;
 
  private:
-  using LockGuard = std::lock_guard<std::mutex>;
+  using LockGuard = std::lock_guard<YieldableMutex>;
   Allocator(const Allocator&) = delete;
   Allocator& operator=(const Allocator&) = delete;
 

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,6 +46,8 @@ struct ThroughputStats {
   uint64_t couldExistOpFalse{0};
   // current number of ops executed. Read periodically to track progress
   uint64_t ops{0};
+
+  uint64_t yields{0};
 
   // operator overload to aggregate multiple instances of ThroughputStats, one
   // from each  thread

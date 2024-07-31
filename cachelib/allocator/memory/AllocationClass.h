@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,9 +28,11 @@
 #include "cachelib/allocator/datastruct/SList.h"
 #include "cachelib/allocator/memory/CompressedPtr.h"
 #include "cachelib/allocator/memory/MemoryAllocatorStats.h"
+#include "cachelib/allocator/memory/Prefetcher.h"
 #include "cachelib/allocator/memory/Slab.h"
 #include "cachelib/allocator/memory/SlabAllocator.h"
 #include "cachelib/allocator/memory/serialize/gen-cpp2/objects_types.h"
+#include "cachelib/common/Mutex.h"
 
 namespace facebook {
 namespace cachelib {
@@ -196,6 +199,7 @@ class AllocationClass {
           reinterpret_cast<uintptr_t>(prefetchOffsetPtr) + allocationSize_);
       // Prefetch ahead the kForEachAllocPrefetchOffset item.
       __builtin_prefetch(prefetchOffsetPtr, 0, 0);
+      prefetcher_.accessReaper(ptr);
       if (!callback(ptr, allocInfo.value())) {
         return SlabIterationStatus::kAbortIteration;
       }
@@ -409,7 +413,7 @@ class AllocationClass {
 
   // lock for serializing access to currSlab_, currOffset, allocatedSlabs_,
   // freeSlabs_, freedAllocations_.
-  mutable folly::cacheline_aligned<folly::DistributedMutex> lock_;
+  mutable folly::cacheline_aligned<YieldableMutex> lock_;
 
   // the allocation class id.
   const ClassId classId_{-1};
@@ -430,6 +434,8 @@ class AllocationClass {
 
   const SlabAllocator& slabAlloc_;
 
+  const Prefetcher<SlabAllocator> prefetcher_;
+
   // slabs that belong to this allocation class and are not entirely free. The
   // un-used allocations in this are present in freedAllocations_.
   // TODO store the index of the slab instead of the actual pointer. Pointer
@@ -446,6 +452,8 @@ class AllocationClass {
     using CompressedPtr = facebook::cachelib::CompressedPtr;
     using PtrCompressor =
         facebook::cachelib::PtrCompressor<FreeAlloc, SlabAllocator>;
+    using Prefetcher =
+        facebook::cachelib::Prefetcher<SlabAllocator>;
     SListHook<FreeAlloc> hook_{};
   };
 

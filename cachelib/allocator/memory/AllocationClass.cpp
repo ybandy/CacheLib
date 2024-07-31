@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -50,7 +51,8 @@ AllocationClass::AllocationClass(ClassId classId,
       poolId_(poolId),
       allocationSize_(allocSize),
       slabAlloc_(s),
-      freedAllocations_{slabAlloc_.createPtrCompressor<FreeAlloc>()} {
+      prefetcher_(slabAlloc_.createPrefetcher()),
+      freedAllocations_{slabAlloc_.createPtrCompressor<FreeAlloc>(), slabAlloc_.createPrefetcher()} {
   checkState();
 }
 
@@ -101,8 +103,10 @@ AllocationClass::AllocationClass(
       currOffset_(static_cast<uint32_t>(*object.currOffset())),
       currSlab_(s.getSlabForIdx(*object.currSlabIdx())),
       slabAlloc_(s),
+      prefetcher_(slabAlloc_.createPrefetcher()),
       freedAllocations_(*object.freedAllocationsObject(),
-                        slabAlloc_.createPtrCompressor<FreeAlloc>()),
+                        slabAlloc_.createPtrCompressor<FreeAlloc>(),
+                        slabAlloc_.createPrefetcher()),
       canAllocate_(*object.canAllocate()) {
   if (!slabAlloc_.isRestorable()) {
     throw std::logic_error("The allocation class cannot be restored.");
@@ -220,10 +224,14 @@ SlabReleaseContext AllocationClass::startSlabRelease(
         folly::sformat("Invalid hint {} for slab release {}", hint, hintSlab));
   }
 
+  if (folly::fibers::onFiber()) {
+    XLOG(WARN, "startSlabRelease on fiber");
+  }
+
   const Slab* slab;
   SlabHeader* header;
   {
-    std::unique_lock<folly::DistributedMutex> l(*lock_);
+    std::unique_lock l(*lock_);
     // if a hint is provided, use it. If not, try to get a free/allocated slab.
     slab = hint == nullptr ? getSlabForReleaseLocked() : hintSlab;
     if (slab == nullptr) {
@@ -356,9 +364,9 @@ std::pair<bool, std::vector<void*>> AllocationClass::pruneFreeAllocs(
   // allocated slab, release any freed allocations belonging to this slab.
   // Set the bit to true if the corresponding allocation is freed, false
   // otherwise.
-  FreeList freeAllocs{slabAlloc_.createPtrCompressor<FreeAlloc>()};
-  FreeList notInSlab{slabAlloc_.createPtrCompressor<FreeAlloc>()};
-  FreeList inSlab{slabAlloc_.createPtrCompressor<FreeAlloc>()};
+  FreeList freeAllocs{slabAlloc_.createPtrCompressor<FreeAlloc>(), slabAlloc_.createPrefetcher()};
+  FreeList notInSlab{slabAlloc_.createPtrCompressor<FreeAlloc>(), slabAlloc_.createPrefetcher()};
+  FreeList inSlab{slabAlloc_.createPtrCompressor<FreeAlloc>(), slabAlloc_.createPrefetcher()};
 
   lock_->lock_combine([&]() {
     // Take the allocation class free list offline
@@ -410,9 +418,14 @@ std::pair<bool, std::vector<void*>> AllocationClass::pruneFreeAllocs(
     // return allocs from 'notInSlab' to 'freedAllocations_'.
     partitionFreeAllocs(slab, freeAllocs, inSlab, notInSlab);
 
+    if (folly::fibers::onFiber()) {
+      XLOG(WARN, "pruneFreeAllocs on fiber");
+      folly::fibers::yield();
+    } else {
     // Let other threads do some work since we will process lots of batches
     /* sleep override */ std::this_thread::sleep_for(
         std::chrono::microseconds(kFreeAllocsPruneSleepMicroSecs));
+    }
   } while (true);
 
   // Collect the list of active allocations
@@ -480,6 +493,9 @@ void AllocationClass::waitUntilAllFreed(const Slab* slab) {
   while (!allFreed(slab)) {
     if (t.throttle() && t.numThrottles() % 128) {
       XLOG(WARN, "still waiting for all slabs released");
+    }
+    if (folly::fibers::onFiber()) {
+      XLOG(WARN, "waitUntilAllFreed on fiber");
     }
   }
 }

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,10 +20,14 @@
 #include <folly/ScopeGuard.h>
 #include <folly/SharedMutex.h>
 #include <folly/SpinLock.h>
+#include <folly/fibers/FiberManager.h>
 #include <folly/logging/xlog.h>
 #include <folly/portability/Asm.h>
+#include <cxxabi.h>
+#include <dlfcn.h>
 #include <pthread.h>
 
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <system_error>
@@ -372,10 +377,317 @@ class RWBucketLocks : public BaseBucketLocks<LockType, LockAlignmentType> {
   }
 };
 
-using SharedMutexBuckets = RWBucketLocks<folly::SharedMutex>;
-
 // a spinning mutex appearing as a rw mutex
 using SpinBuckets = RWBucketLocks<RWMockLock>;
+
+//#define MUTEX_STATS
+
+struct MutexStat {
+  uint64_t acquired{0};
+  uint64_t contended{0};
+  uint64_t max_contended{0};
+};
+
+class MutexStats {
+  public:
+  class DummyMutexStatsTag {};
+  static folly::ThreadLocal<std::unordered_map<void*, MutexStat>, DummyMutexStatsTag> tlStats;
+  static std::unordered_map<void*, MutexStat> allStats;
+  static std::mutex mutex;
+
+  static void acquire(void *addr, uint64_t contended) {
+      if (MutexStats::tlStats->find(addr) == MutexStats::tlStats->end()) {
+        MutexStats::tlStats->emplace(addr, MutexStat{});
+      }
+      auto& stat = MutexStats::tlStats->at(addr);
+      stat.acquired++;
+      stat.contended += contended;
+      stat.max_contended = std::max(stat.max_contended, contended);
+  }
+
+  static void flush() {
+    std::lock_guard<std::mutex> l(mutex);
+    for (auto& stat: *tlStats) {
+      if (allStats.find(stat.first) == allStats.end()) {
+          allStats.emplace(stat.first, stat.second);
+      } else {
+          auto& allStat = allStats.at(stat.first);
+          allStat.acquired += stat.second.acquired;
+          allStat.contended += stat.second.contended;
+          allStat.max_contended = std::max(allStat.max_contended, stat.second.contended);
+      }
+      stat.second.acquired = 0;
+      stat.second.contended = 0;
+      stat.second.max_contended = 0;
+    }
+  }
+
+  static void render() {
+    std::cout << "#symbol,address,acquired,contended,max_contended\n";
+    for (auto& stat: allStats) {
+      Dl_info info;
+      char *name = NULL;
+      if (dladdr(stat.first, &info)) {
+        name = abi::__cxa_demangle(info.dli_sname, NULL, 0, NULL);
+      }
+      std::cout << folly::sformat("\"{}\",{},{},{},{}\n",
+          name, stat.first, stat.second.acquired, stat.second.contended, stat.second.max_contended);
+      free(name);
+    }
+  }
+};
+
+//#define OnFiber() 1
+#define OnFiber() folly::fibers::onFiber()
+
+class YieldableMutex {
+ public:
+  YieldableMutex() noexcept {}
+  YieldableMutex(const YieldableMutex&) = delete;
+  ~YieldableMutex() {}
+
+  void lock() {
+    if (OnFiber()) {
+      uint64_t contended = 0;
+
+      while (!mutex_.try_lock()) {
+#ifdef MUTEX_STATS
+        contended++;
+#endif
+        folly::fibers::yield();
+      }
+#ifdef MUTEX_STATS
+      MutexStats::acquire(__builtin_return_address(0), contended);
+#endif
+    } else {
+      mutex_.lock();
+    }
+  }
+
+  bool try_lock() {
+    if (mutex_.try_lock()) {
+      return true;
+    }
+
+    if (OnFiber()) {
+      folly::fibers::yield();
+      return mutex_.try_lock();
+    }
+
+    return false;
+  }
+
+  void unlock() {
+    mutex_.unlock();
+  }
+
+  template <typename Func>
+  auto lock_combine(Func func) -> folly::invoke_result_t<const Func&> {
+    std::lock_guard l{*this};
+    return func();
+  }
+
+private:
+  std::mutex mutex_;
+};
+
+class YieldableSharedMutex {
+ public:
+  class ReadHolder {
+    ReadHolder() : lock_(nullptr) {}
+
+   public:
+    explicit ReadHolder(const YieldableSharedMutex* lock)
+        : lock_(const_cast<YieldableSharedMutex*>(lock)) {
+      if (lock_) {
+        lock_->lock_shared();
+      }
+    }
+
+    explicit ReadHolder(const YieldableSharedMutex& lock)
+        : lock_(const_cast<YieldableSharedMutex*>(&lock)) {
+      lock_->lock_shared();
+    }
+
+    ReadHolder(ReadHolder&& rhs) noexcept
+        : lock_(rhs.lock_) {
+      rhs.lock_ = nullptr;
+    }
+
+    ReadHolder& operator=(ReadHolder&& rhs) noexcept {
+      std::swap(lock_, rhs.lock_);
+      return *this;
+    }
+
+    ReadHolder(const ReadHolder& rhs) = delete;
+    ReadHolder& operator=(const ReadHolder& rhs) = delete;
+
+    ~ReadHolder() { unlock(); }
+
+    void unlock() {
+      if (lock_) {
+        lock_->unlock_shared();
+        lock_ = nullptr;
+      }
+    }
+
+   private:
+    YieldableSharedMutex* lock_;
+  };
+
+  class WriteHolder {
+    WriteHolder() : lock_(nullptr) {}
+
+   public:
+    explicit WriteHolder(YieldableSharedMutex* lock) : lock_(lock) {
+      if (lock_) {
+        lock_->lock();
+      }
+    }
+
+    explicit WriteHolder(YieldableSharedMutex& lock) : lock_(&lock) {
+      lock_->lock();
+    }
+
+    WriteHolder(WriteHolder&& rhs) noexcept : lock_(rhs.lock_) {
+      rhs.lock_ = nullptr;
+    }
+
+    WriteHolder& operator=(WriteHolder&& rhs) noexcept {
+      std::swap(lock_, rhs.lock_);
+      return *this;
+    }
+
+    WriteHolder(const WriteHolder& rhs) = delete;
+    WriteHolder& operator=(const WriteHolder& rhs) = delete;
+
+    ~WriteHolder() { unlock(); }
+
+    void unlock() {
+      if (lock_) {
+        lock_->unlock();
+        lock_ = nullptr;
+      }
+    }
+
+   private:
+    YieldableSharedMutex* lock_;
+  };
+
+  YieldableSharedMutex() noexcept {}
+  YieldableSharedMutex(const YieldableSharedMutex&) = delete;
+  ~YieldableSharedMutex() {}
+
+  void lock() {
+    if (OnFiber()) {
+      uint64_t contended = 0;
+      while (!mutex_.try_lock()) {
+#ifdef MUTEX_STATS
+        contended++;
+#endif
+        folly::fibers::yield();
+      }
+#ifdef MUTEX_STATS
+      MutexStats::acquire(__builtin_return_address(0), contended);
+#endif
+    } else {
+      mutex_.lock();
+    }
+  }
+
+  bool try_lock() {
+    if (mutex_.try_lock()) {
+      return true;
+    }
+
+    if (OnFiber()) {
+      folly::fibers::yield();
+      return mutex_.try_lock();
+    }
+
+    return false;
+  }
+
+  void unlock() {
+    mutex_.unlock();
+  }
+
+  void lock_shared() {
+    if (OnFiber()) {
+      uint64_t contended = 0;
+      while (!mutex_.try_lock_shared()) {
+#ifdef MUTEX_STATS
+        contended++;
+#endif
+        folly::fibers::yield();
+      }
+#ifdef MUTEX_STATS
+      MutexStats::acquire(__builtin_return_address(0), contended);
+#endif
+    } else {
+      mutex_.lock_shared();
+    }
+  }
+
+  bool try_lock_shared() {
+    if (mutex_.try_lock_shared()) {
+      return true;
+    }
+
+    if (OnFiber()) {
+      folly::fibers::yield();
+      return mutex_.try_lock_shared();
+    }
+
+    return false;
+  }
+
+  void unlock_shared() {
+    mutex_.unlock_shared();
+  }
+
+private:
+  folly::SharedMutex mutex_;
+};
+
+using SharedMutexBuckets = RWBucketLocks<YieldableSharedMutex>;
+
+class YieldableSpinLock {
+ public:
+  YieldableSpinLock() noexcept {}
+  YieldableSpinLock(const YieldableSpinLock&) = delete;
+  ~YieldableSpinLock() {}
+
+  void lock() {
+    if (OnFiber()) {
+      while (!lock_.try_lock()) {
+        folly::fibers::yield();
+      }
+    } else {
+      lock_.lock();
+    }
+  }
+
+  bool try_lock() {
+    if (lock_.try_lock()) {
+      return true;
+    }
+
+    if (OnFiber()) {
+      folly::fibers::yield();
+      return lock_.try_lock();
+    }
+
+    return false;
+  }
+
+  void unlock() {
+    lock_.unlock();
+  }
+
+private:
+  folly::SpinLock lock_;
+};
 
 } // namespace cachelib
 } // namespace facebook

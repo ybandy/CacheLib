@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -75,6 +76,8 @@ class DynamicRandomAP final : public AdmissionPolicy {
 
     // Function that returns number of bytes written to device
     FnBytesWritten fnBytesWritten;
+
+    uint64_t bytesWrittenOffset{0};
 
     // Random number generator seed
     uint32_t seed{1};
@@ -170,6 +173,8 @@ class DynamicRandomAP final : public AdmissionPolicy {
   // Not thread safe.
   void update();
 
+  uint64_t getBytesWritten();
+
   // The rate we are configered to write on average over a day.
   const uint64_t targetRate_{};
   // The rate we are confiigured to write at most.
@@ -181,6 +186,7 @@ class DynamicRandomAP final : public AdmissionPolicy {
   const double maxChange_{};
   const double minChange_{};
   const FnBytesWritten fnBytesWritten_;
+  const uint64_t bytesWrittenOffset_{};
   const double lowerBound_{};
   const double upperBound_{};
   const FnBypass fnBypass_;

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,6 +40,7 @@ class CacheMonitorFactory {
   virtual ~CacheMonitorFactory() = default;
   virtual std::unique_ptr<CacheMonitor> create(LruAllocator& cache) = 0;
   virtual std::unique_ptr<CacheMonitor> create(Lru2QAllocator& cache) = 0;
+  virtual std::unique_ptr<CacheMonitor> create(TinyLFUAllocator& cache) = 0;
 };
 
 // Parse memory tiers configuration from JSON config
@@ -75,6 +77,8 @@ struct CacheConfig : public JSONConfig {
   uint64_t rebalanceMinSlabs{1};
   double rebalanceDiffRatio{0.25};
   bool moveOnSlabRelease{false};
+
+  uint64_t prefetchDelayNSec{0};
 
   uint64_t htBucketPower{22}; // buckets in hash table
   uint64_t htLockPower{20};   // locks in hash table
@@ -184,12 +188,19 @@ struct CacheConfig : public JSONConfig {
   // number of asynchronous worker thread for navy write operation,
   uint32_t navyWriterThreads{32};
 
+  bool navyTryBlocking{false};
+
   // buffer of clean regions to be maintained free to ensure writes
   // into navy don't queue behind a reclaim of region.
   uint32_t navyCleanRegions{1};
 
   // disabled when value is 0
   uint32_t navyAdmissionWriteRateMB{0};
+
+  uint32_t navyBytesWrittenOffsetGB{0};
+
+  // disabled when value is 0
+  uint32_t navyMaxWriteRateMB{0};
 
   // maximum pending inserts before rejecting new inserts.
   uint32_t navyMaxConcurrentInserts{1000000};
@@ -247,6 +258,8 @@ struct CacheConfig : public JSONConfig {
   // enable the ItemDestructor feature, but not check correctness,
   // this verifies whether the feature affects throughputs.
   bool enableItemDestructor{false};
+
+  bool disableItemReaper{false};
 
   // If specified, we will not admit any item into NvmCache if their
   // eviction-age is more than this threshold. 0 means no threshold

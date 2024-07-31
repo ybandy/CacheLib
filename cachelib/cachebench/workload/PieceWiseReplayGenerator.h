@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,27 +31,38 @@ constexpr uint32_t kMaxRequestQueueSize = 10000;
 
 class PieceWiseReplayGenerator : public ReplayGeneratorBase {
  public:
+
+  const ColumnTable columnTable_ = {};
+
   explicit PieceWiseReplayGenerator(const StressorConfig& config)
       : ReplayGeneratorBase(config),
-        traceStream_(config, 0, {}),
+        numTraces_(config.numThreads, 0),
         pieceCacheAdapter_(config.maxCachePieces,
                            config.replayGeneratorConfig.numAggregationFields,
                            config.replayGeneratorConfig.statsPerAggField),
         activeReqQ_(config.numThreads),
+        resubmitQ_(config.numThreads),
         threadFinished_(config.numThreads) {
     for (uint32_t i = 0; i < numShards_; ++i) {
       activeReqQ_[i] =
-          std::make_unique<folly::ProducerConsumerQueue<PieceWiseReqWrapper>>(
+          std::make_unique<folly::ProducerConsumerQueue<std::unique_ptr<PieceWiseReqWrapper>>>(
+              //std::in_place_t{},
               kMaxRequestQueueSize);
       threadFinished_[i].store(false, std::memory_order_relaxed);
+      if (config_.traceFileMultiStreams || (i == 0))
+        traceStreams_.emplace_back(std::make_unique<TraceFileStream>(config, 0, columnTable_));
     }
 
+    if (config_.traceFileMultiStreams)
+      return;
     traceGenThread_ = std::thread([this]() { getReqFromTrace(); });
   }
 
   virtual ~PieceWiseReplayGenerator() {
     markShutdown();
-    traceGenThread_.join();
+    if (traceGenThread_.joinable()) {
+      traceGenThread_.join();
+    }
 
     XLOG(INFO) << "ProducerConsumerQueue Stats: producer waits: "
                << queueProducerWaitCounts_.get()
@@ -68,7 +80,7 @@ class PieceWiseReplayGenerator : public ReplayGeneratorBase {
   // getReq generates the next request from the named trace file.
   // it expects a comma separated file (possibly with a header)
   const Request& getReq(
-      uint8_t,
+      uint16_t,
       std::mt19937_64&,
       std::optional<uint64_t> lastRequestId = std::nullopt) override;
 
@@ -97,14 +109,33 @@ class PieceWiseReplayGenerator : public ReplayGeneratorBase {
 
  private:
   void getReqFromTrace();
+  bool genReq(std::unique_ptr<PieceWiseReqWrapper>& req);
 
-  folly::ProducerConsumerQueue<PieceWiseReqWrapper>& getTLReqQueue() {
+  folly::ProducerConsumerQueue<std::unique_ptr<PieceWiseReqWrapper>>& getTLReqQueue() {
     if (!tlStickyIdx_.get()) {
       tlStickyIdx_.reset(new uint32_t(incrementalIdx_++));
     }
 
     XCHECK_LT(*tlStickyIdx_, numShards_);
     return *activeReqQ_[*tlStickyIdx_];
+  }
+
+  inline TraceFileStream& getTraceFileStream(size_t shardId) {
+    XCHECK_LT(shardId, numShards_);
+    return *traceStreams_[shardId];
+  }
+
+  inline TraceFileStream& getTraceFileStream() {
+    return config_.traceFileMultiStreams ? getTraceFileStream(*tlStickyIdx_) : getTraceFileStream(0);
+  }
+
+  std::queue<std::unique_ptr<PieceWiseReqWrapper>>& getTLResubmitQueue() {
+    if (!tlStickyIdx_.get()) {
+      tlStickyIdx_.reset(new uint32_t(incrementalIdx_++));
+    }
+
+    XCHECK_LT(*tlStickyIdx_, numShards_);
+    return resubmitQ_[*tlStickyIdx_];
   }
 
   // Line format for the trace file:
@@ -133,7 +164,8 @@ class PieceWiseReplayGenerator : public ReplayGeneratorBase {
     TOTAL_DEFINED_FIELDS = 12
   };
 
-  TraceFileStream traceStream_;
+  std::vector<std::unique_ptr<TraceFileStream>> traceStreams_;
+  std::vector<uint64_t> numTraces_;
 
   PieceWiseCacheAdapter pieceCacheAdapter_;
 
@@ -151,8 +183,11 @@ class PieceWiseReplayGenerator : public ReplayGeneratorBase {
   // Vector size is equal to the # of stressor threads;
   // tlStickyIdx_ is used to index.
   std::vector<
-      std::unique_ptr<folly::ProducerConsumerQueue<PieceWiseReqWrapper>>>
+      std::unique_ptr<folly::ProducerConsumerQueue<std::unique_ptr<PieceWiseReqWrapper>>>>
       activeReqQ_;
+  std::vector<
+      std::queue<std::unique_ptr<PieceWiseReqWrapper>>>
+      resubmitQ_;
 
   // Thread that finish its operations mark it here, so we will skip
   // further request on its shard

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -492,6 +493,7 @@ std::unique_ptr<NvmItem> NvmCache<C>::makeNvmItem(const Item& item) {
   } else {
     Blob blob = makeBlob(item);
     const size_t bufSize = NvmItem::estimateVariableSize(blob);
+    cache_.prefetchRead(item.getMemory(), blob.data.size());
     return std::unique_ptr<NvmItem>(new (bufSize) NvmItem(
         poolId, item.getCreationTime(), item.getExpiryTime(), blob));
   }
@@ -679,6 +681,7 @@ typename NvmCache<C>::WriteHandle NvmCache<C>::createItem(
 
   XDCHECK_LE(pBlob.data.size(), getStorageSizeInNvm(*it));
   XDCHECK_LE(pBlob.origAllocSize, pBlob.data.size());
+  cache_.prefetchWrite(it->getMemory(), pBlob.data.size());
   ::memcpy(it->getMemory(), pBlob.data.data(), pBlob.data.size());
   it->markNvmClean();
 
@@ -924,7 +927,7 @@ template <typename C>
 uint64_t NvmCache<C>::getNvmItemRemovedSize() const {
   uint64_t size = 0;
   for (size_t i = 0; i < kShards; ++i) {
-    auto lock = std::unique_lock<std::mutex>{itemDestructorMutex_[i]};
+    auto lock = std::unique_lock<YieldableMutex>{itemDestructorMutex_[i]};
     size += itemRemoved_[i].size();
   }
   return size;

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -41,11 +42,12 @@ class WorkloadGenerator : public GeneratorBase {
   virtual ~WorkloadGenerator() {}
 
   const Request& getReq(
-      uint8_t poolId,
+      uint16_t poolId,
       std::mt19937_64& gen,
       std::optional<uint64_t> lastRequestId = std::nullopt) override;
 
   const std::vector<std::string>& getAllKeys() const override { return keys_; }
+  void renderDistribution(std::ostream& /*out*/) const override;
 
  private:
   void generateFirstKeyIndexForPool();
@@ -69,6 +71,8 @@ class WorkloadGenerator : public GeneratorBase {
   std::vector<std::uniform_int_distribution<uint32_t>> keyGenForPool_;
 
   std::vector<WorkloadDistribution> workloadDist_;
+
+  static constexpr bool enableRenderDist_{false};
 };
 } // namespace cachebench
 } // namespace cachelib

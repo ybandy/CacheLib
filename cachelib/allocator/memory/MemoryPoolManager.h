@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,7 +46,7 @@ struct PoolAdviseReclaimData {
 class MemoryPoolManager {
  public:
   // maximum number of pools that we support.
-  static constexpr unsigned int kMaxPools = 64;
+  static constexpr unsigned int kMaxPools = 1024;
 
   // creates a memory pool manager for this slabAllocator.
   // @param slabAlloc  the slab allocator to be used for the memory pools.

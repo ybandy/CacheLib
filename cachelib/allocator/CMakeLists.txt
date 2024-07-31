@@ -1,4 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# Copyright (c) 2024 Kioxia Corporation.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -43,6 +44,7 @@ add_library (cachelib_allocator
     memory/MemoryAllocator.cpp
     memory/MemoryPool.cpp
     memory/MemoryPoolManager.cpp
+    memory/Prefetcher.cpp
     MemoryMonitor.cpp
     memory/SlabAllocator.cpp
     memory/Slab.cpp

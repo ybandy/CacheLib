@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +19,7 @@
 #include <folly/Format.h>
 #include <folly/Random.h>
 
+#include <atomic>
 #include <chrono>
 #include <ctime>
 #include <string>
@@ -150,6 +152,8 @@ struct Request {
   // Use case specific data that will be included in the request. This can be
   // used to track metadata that is specific to a particular application.
   std::string itemValue;
+
+  std::atomic<uint64_t> counter{0};
 
  private:
   std::atomic<OpType> op{OpType::kGet};

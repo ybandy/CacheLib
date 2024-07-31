@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,10 +22,10 @@
 #include <folly/Range.h>
 
 #include <cstdint>
-#include <mutex>
 
 #include "cachelib/cachebench/util/Request.h"
 #include "cachelib/common/AtomicCounter.h"
+#include "cachelib/common/Mutex.h"
 #include "cachelib/common/PercentileStats.h"
 #include "cachelib/common/piecewise/GenericPieces.h"
 
@@ -90,7 +91,7 @@ class PieceWiseCacheStats {
       objGetFullHits.set(0);
 
       {
-        std::lock_guard<std::mutex> lck(tsMutex_);
+        std::lock_guard<YieldableMutex> lck(tsMutex_);
         startTimestamp_ = 0;
         endTimestamp_ = 0;
       }
@@ -101,7 +102,7 @@ class PieceWiseCacheStats {
 
    private:
     // The starting time and end time for counting the stats.
-    std::mutex tsMutex_;
+    YieldableMutex tsMutex_;
     uint64_t startTimestamp_{0};
     uint64_t endTimestamp_{0};
   };

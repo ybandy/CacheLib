@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -486,6 +487,19 @@ inline typename Lru2QAllocator::MMConfig makeMMConfig(
                                   config.lru2qColdPct,
                                   0,
                                   config.useCombinedLockForIterators);
+}
+
+// LRU
+template <>
+inline typename TinyLFUAllocator::MMConfig makeMMConfig(
+    CacheConfig const& config) {
+  return TinyLFUAllocator::MMConfig(config.lruRefreshSec,
+                                  config.lruRefreshRatio,
+                                  config.lruUpdateOnWrite,
+                                  config.lruUpdateOnRead,
+                                  config.tryLockUpdate,
+                                  32,
+                                  1);
 }
 
 } // namespace cachebench

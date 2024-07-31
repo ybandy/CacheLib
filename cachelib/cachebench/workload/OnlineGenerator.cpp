@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -51,7 +52,7 @@ OnlineGenerator::OnlineGenerator(const StressorConfig& config)
   generateKeyWorkloadDistributions();
 }
 
-const Request& OnlineGenerator::getReq(uint8_t poolId,
+const Request& OnlineGenerator::getReq(uint16_t poolId,
                                        std::mt19937_64& gen,
                                        std::optional<uint64_t>) {
   size_t keyIdx = getKeyIdx(poolId, gen);
@@ -81,7 +82,7 @@ void OnlineGenerator::generateKeyLengths() {
   }
 }
 
-void OnlineGenerator::generateKey(uint8_t pid, size_t idx, std::string& key) {
+void OnlineGenerator::generateKey(uint16_t pid, size_t idx, std::string& key) {
   // All keys are printable lower case english alphabet. we need to ensure the
   // key lengths are consistent for an idx.
   const auto keySize = keyLengths_[pid][idx % keyLengths_[pid].size()];
@@ -98,7 +99,7 @@ void OnlineGenerator::generateKey(uint8_t pid, size_t idx, std::string& key) {
 }
 
 typename std::vector<std::vector<size_t>>::iterator
-OnlineGenerator::generateSize(uint8_t pid, size_t idx) {
+OnlineGenerator::generateSize(uint16_t pid, size_t idx) {
   return sizes_[workloadIdx(pid)].begin() +
          idx % sizes_[workloadIdx(pid)].size();
 }
@@ -136,7 +137,7 @@ void OnlineGenerator::generateFirstKeyIndexForPool() {
   }
 }
 
-uint64_t OnlineGenerator::getKeyIdx(uint8_t poolId, std::mt19937_64& gen) {
+uint64_t OnlineGenerator::getKeyIdx(uint16_t poolId, std::mt19937_64& gen) {
   return (*workloadPopDist_[poolId])(gen);
 }
 

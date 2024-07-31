@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +22,7 @@
 #include "cachelib/allocator/memory/AllocationClass.h"
 #include "cachelib/allocator/memory/MemoryPool.h"
 #include "cachelib/allocator/memory/MemoryPoolManager.h"
+#include "cachelib/allocator/memory/Prefetcher.h"
 #include "cachelib/allocator/memory/Slab.h"
 #include "cachelib/allocator/memory/SlabAllocator.h"
 
@@ -87,11 +89,13 @@ class MemoryAllocator {
     Config(std::set<uint32_t> sizes,
            bool zeroOnRelease,
            bool disableCoredump,
-           bool _lockMemory)
+           bool _lockMemory,
+           uint64_t _prefetchDelayNSec)
         : allocSizes(std::move(sizes)),
           enableZeroedSlabAllocs(zeroOnRelease),
           disableFullCoredump(disableCoredump),
-          lockMemory(_lockMemory) {}
+          lockMemory(_lockMemory),
+          prefetchDelayNSec(_prefetchDelayNSec) {}
 
     // Hint to determine the allocation class sizes
     std::set<uint32_t> allocSizes;
@@ -109,6 +113,8 @@ class MemoryAllocator {
     // allocator is not shared, user needs to ensure there are appropriate
     // rlimits setup to lock the memory.
     bool lockMemory{false};
+
+    uint64_t prefetchDelayNSec{0};
   };
 
   // Creates a memory allocator out of the caller allocated memory region. The
@@ -517,10 +523,16 @@ class MemoryAllocator {
   template <typename PtrType>
   using PtrCompressor =
       facebook::cachelib::PtrCompressor<PtrType, SlabAllocator>;
+  using Prefetcher =
+      facebook::cachelib::Prefetcher<SlabAllocator>;
 
   template <typename PtrType>
   PtrCompressor<PtrType> createPtrCompressor() {
     return slabAllocator_.createPtrCompressor<PtrType>();
+  }
+
+  Prefetcher createPrefetcher() {
+    return slabAllocator_.createPrefetcher();
   }
 
   // compress a given pointer to a valid allocation made out of this allocator

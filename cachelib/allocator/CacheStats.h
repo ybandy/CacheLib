@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,6 +41,13 @@ struct EvictionStatPerType {
 
   // the estimated age after removing a slab worth of elements
   uint64_t projectedAge = 0ULL;
+
+  EvictionStatPerType& operator+=(const EvictionStatPerType& other) {
+    oldestElementAge = std::max(oldestElementAge, other.oldestElementAge) ;
+    size += other.size;
+    projectedAge = !projectedAge ? other.projectedAge : std::min(projectedAge, other.projectedAge) ;
+    return *this;
+  }
 };
 
 // stats class for one MM container (a.k.a one allocation class) related to

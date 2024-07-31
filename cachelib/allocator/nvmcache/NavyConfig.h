@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -73,6 +74,11 @@ class DynamicRandomAPConfig {
     return *this;
   }
 
+  DynamicRandomAPConfig& setBytesWrittenOffset(uint64_t bytesWrittenOffset) noexcept {
+    bytesWrittenOffset_ = bytesWrittenOffset;
+    return *this;
+  }
+
   // Set the max write rate to device in bytes/s.
   // This ensures write at any given second don't exceed this limit despite a
   // possibility of writing more to stay within the target rate above.
@@ -114,6 +120,8 @@ class DynamicRandomAPConfig {
 
   uint64_t getAdmWriteRate() const { return admWriteRate_; }
 
+  uint64_t getBytesWrittenOffset() const { return bytesWrittenOffset_; }
+
   uint64_t getMaxWriteRate() const { return maxWriteRate_; }
 
   size_t getAdmSuffixLength() const { return admSuffixLen_; }
@@ -130,6 +138,7 @@ class DynamicRandomAPConfig {
   // Admission policy target rate, bytes/s.
   // Zero means no rate limiting.
   uint64_t admWriteRate_{0};
+  uint64_t bytesWrittenOffset_{0};
   // The max write rate to device in bytes/s to stay within the device limit
   // of saturation to avoid latency increase.
   uint64_t maxWriteRate_{0};
@@ -502,6 +511,7 @@ class NavyConfig {
   unsigned int getReaderThreads() const { return readerThreads_; }
   unsigned int getWriterThreads() const { return writerThreads_; }
   uint64_t getNavyReqOrderingShards() const { return navyReqOrderingShards_; }
+  bool getNavyTryBlocking() const { return navyTryBlocking_; }
 
   // ============ other settings =============
   uint32_t getMaxConcurrentInserts() const { return maxConcurrentInserts_; }
@@ -568,6 +578,9 @@ class NavyConfig {
   // Set Navy request ordering shards (expressed as power of two).
   // @throw std::invalid_argument if the input value is 0.
   void setNavyReqOrderingShards(uint64_t navyReqOrderingShards);
+  void setNavyTryBlocking(bool navyTryBlocking) noexcept {
+    navyTryBlocking_ = navyTryBlocking;
+  }
 
   // ============ Other settings =============
   void setMaxConcurrentInserts(uint32_t maxConcurrentInserts) noexcept {
@@ -624,6 +637,8 @@ class NavyConfig {
   // Navy.
   // This value needs to be non-zero.
   uint64_t navyReqOrderingShards_{20};
+
+  bool navyTryBlocking_{false};
 
   // ============ Other settings =============
   // Maximum number of concurrent inserts we allow globally for Navy.

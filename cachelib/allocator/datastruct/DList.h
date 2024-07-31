@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -72,11 +73,19 @@ struct CACHELIB_PACKED_ATTR DListHook {
     return updateTime_;
   }
 
+  void setShard(int shard) noexcept { shard_ = shard; }
+
+  int getShard() const noexcept {
+    XDCHECK_NE(shard_, -1);
+    return shard_;
+  }
+
  private:
   CompressedPtr next_{}; // next node in the linked list
   CompressedPtr prev_{}; // previous node in the linked list
   // timestamp when this was last updated to the head of the list
   Time updateTime_{0};
+  int shard_{-1};
 };
 
 // uses a double linked list to implement an LRU. T must be have a public
@@ -87,20 +96,22 @@ class DList {
   using CompressedPtr = typename T::CompressedPtr;
   using PtrCompressor = typename T::PtrCompressor;
   using DListObject = serialization::DListObject;
+  using Prefetcher = typename T::Prefetcher;
 
   DList() = default;
   DList(const DList&) = delete;
   DList& operator=(const DList&) = delete;
 
-  explicit DList(PtrCompressor compressor) noexcept
-      : compressor_(std::move(compressor)) {}
+  explicit DList(PtrCompressor compressor, Prefetcher prefetcher) noexcept
+      : compressor_(std::move(compressor)), prefetcher_(std::move(prefetcher)) {}
 
   // Restore DList from saved state.
   //
   // @param object              Save DList object
   // @param compressor          PtrCompressor object
-  DList(const DListObject& object, PtrCompressor compressor)
+  DList(const DListObject& object, PtrCompressor compressor, Prefetcher prefetcher)
       : compressor_(std::move(compressor)),
+        prefetcher_(std::move(prefetcher)),
         head_(compressor_.unCompress(CompressedPtr{*object.compressedHead()})),
         tail_(compressor_.unCompress(CompressedPtr{*object.compressedTail()})),
         size_(*object.size()) {}
@@ -248,6 +259,8 @@ class DList {
   void unlink(const T& node) noexcept;
 
   const PtrCompressor compressor_{};
+
+  const Prefetcher prefetcher_;
 
   // head of the linked list
   T* head_{nullptr};

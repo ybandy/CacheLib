@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,6 +28,7 @@ void DList<T, HookPtr>::linkAtHead(T& node) noexcept {
   setPrev(node, nullptr);
   // fix the prev ptr of head
   if (head_ != nullptr) {
+    prefetcher_.accessMMContainerLinkAtHead(head_);
     setPrev(*head_, &node);
   }
   head_ = &node;
@@ -68,11 +70,13 @@ void DList<T, HookPtr>::insertBefore(T& nextNode, T& node) noexcept {
 
   setPrev(node, prev);
   if (prev != nullptr) {
+    prefetcher_.accessMMContainerInsertBefore(prev);
     setNext(*prev, &node);
   } else {
     head_ = &node;
   }
 
+  prefetcher_.accessMMContainerInsertBefore(&nextNode);
   setPrev(nextNode, &node);
   setNext(node, &nextNode);
   size_++;
@@ -94,9 +98,11 @@ void DList<T, HookPtr>::unlink(const T& node) noexcept {
 
   // fix the next and prev ptrs of the node before and after us.
   if (prev != nullptr) {
+    prefetcher_.accessMMContainerUnlink(prev);
     setNextFrom(*prev, node);
   }
   if (next != nullptr) {
+    prefetcher_.accessMMContainerUnlink(next);
     setPrevFrom(*next, node);
   }
   size_--;

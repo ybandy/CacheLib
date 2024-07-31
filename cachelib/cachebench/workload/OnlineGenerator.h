@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -42,7 +43,7 @@ class OnlineGenerator : public GeneratorBase {
   virtual ~OnlineGenerator() {}
 
   const Request& getReq(
-      uint8_t poolId,
+      uint16_t poolId,
       std::mt19937_64& gen,
       std::optional<uint64_t> lastRequestId = std::nullopt) override;
 
@@ -51,14 +52,14 @@ class OnlineGenerator : public GeneratorBase {
   }
 
  private:
-  uint64_t getKeyIdx(uint8_t poolId, std::mt19937_64& gen);
+  uint64_t getKeyIdx(uint16_t poolId, std::mt19937_64& gen);
   void generateFirstKeyIndexForPool();
-  void generateKey(uint8_t poolId, size_t idx, std::string& key);
+  void generateKey(uint16_t poolId, size_t idx, std::string& key);
   void generateKeyLengths();
 
   void generateSizes();
   typename std::vector<std::vector<size_t>>::iterator generateSize(
-      uint8_t poolId, size_t idx);
+      uint16_t poolId, size_t idx);
   void generateKeyWorkloadDistributions();
 
   // if there is only one workloadDistribution, use it for everything.

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -70,8 +71,9 @@ CacheAllocator<CacheTrait>::CacheAllocator(
                                ? std::make_unique<CCacheManager>(*allocator_)
                                : restoreCCacheManager()),
       compressor_(createPtrCompressor()),
+      prefetcher_(createPrefetcher()),
       mmContainers_(type == InitMemType::kMemAttach
-                        ? deserializeMMContainers(*deserializer_, compressor_)
+                        ? deserializeMMContainers(*deserializer_, compressor_, prefetcher_)
                         : MMContainers{}),
       accessContainer_(initAccessContainer(
           type, detail::kShmHashTableName, config.accessConfig)),
@@ -235,6 +237,8 @@ void CacheAllocator<CacheTrait>::initWorkers() {
                           config_.poolOptimizeStrategy,
                           config_.ccacheOptimizeStepSizePercent);
   }
+
+  startNewCheckpointTraceDumper(std::chrono::seconds(600));
 }
 
 template <typename CacheTrait>
@@ -269,6 +273,7 @@ CacheAllocator<CacheTrait>::initAccessContainer(InitMemType type,
   if (type == InitMemType::kNone) {
     return std::make_unique<AccessContainer>(
         config, compressor_,
+        prefetcher_,
         [this](Item* it) -> WriteHandle { return acquire(it); });
   } else if (type == InitMemType::kMemNew) {
     return std::make_unique<AccessContainer>(
@@ -281,6 +286,7 @@ CacheAllocator<CacheTrait>::initAccessContainer(InitMemType type,
                 ShmSegmentOpts(config.getPageSize()))
             .addr,
         compressor_,
+        prefetcher_,
         [this](Item* it) -> WriteHandle { return acquire(it); });
   } else if (type == InitMemType::kMemAttach) {
     return std::make_unique<AccessContainer>(
@@ -288,6 +294,7 @@ CacheAllocator<CacheTrait>::initAccessContainer(InitMemType type,
         config,
         shmManager_->attachShm(name),
         compressor_,
+        prefetcher_,
         [this](Item* it) -> WriteHandle { return acquire(it); });
   }
 
@@ -354,6 +361,7 @@ CacheAllocator<CacheTrait>::allocateInternal(PoolId pid,
       allocator_->free(memory);
     };
 
+    prefetcher_.accessAcquire(memory);
     handle = acquire(new (memory) Item(key, size, creationTime, expiryTime));
     if (handle) {
       handle.markNascent();
@@ -425,6 +433,7 @@ CacheAllocator<CacheTrait>::allocateChainedItemInternal(
 
   SCOPE_FAIL { allocator_->free(memory); };
 
+  prefetcher_.accessAcquire(memory);
   auto child = acquire(
       new (memory) ChainedItem(compressor_.compress(parent.getInternal()), size,
                                util::getCurrentTimeSec()));
@@ -448,7 +457,12 @@ void CacheAllocator<CacheTrait>::addChainedItem(WriteHandle& parent,
                        child ? child->toString() : "nullptr"));
   }
 
-  auto l = chainedItemLocks_.lockExclusive(parent->getKey());
+  prefetcher_.accessPreamble(parent.get());
+  prefetcher_.accessPreamble(child.get());
+
+  Key key = parent->getKey();
+  prefetcher_.accessKey(key.start());
+  auto l = chainedItemLocks_.lockExclusive(key);
 
   // Insert into secondary lookup table for chained allocation
   auto oldHead = chainedItemAccessContainer_->insertOrReplace(*child);
@@ -467,7 +481,8 @@ void CacheAllocator<CacheTrait>::addChainedItem(WriteHandle& parent,
   // Count a new child
   stats_.numChainedChildItems.inc();
 
-  insertInMMContainer(*child);
+  HashedKey hk{parent->getKey()};
+  insertInMMContainer(*child, hk);
 
   // Increment refcount since this chained item is now owned by the parent
   // Parent will decrement the refcount upon release. Since this is an
@@ -825,6 +840,7 @@ CacheAllocator<CacheTrait>::releaseBackToAllocator(Item& it,
 
     while (head) {
       auto next = head->getNext(compressor_);
+      prefetcher_.accessChainedItem(next);
 
       const auto childInfo =
           allocator_->getAllocInfo(static_cast<const void*>(head));
@@ -924,6 +940,7 @@ void CacheAllocator<CacheTrait>::release(Item* it, bool isNascent) {
     return;
   }
 
+  prefetcher_.accessRelease(it);
   const auto ref = decRef(*it);
 
   if (UNLIKELY(ref == 0)) {
@@ -949,9 +966,18 @@ bool CacheAllocator<CacheTrait>::replaceInMMContainer(Item& oldItem,
   auto& oldContainer = getMMContainer(oldItem);
   auto& newContainer = getMMContainer(newItem);
   if (&oldContainer == &newContainer) {
+#ifndef NDEBUG
+    HashedKey oldHk{oldItem.getKey()};
+    HashedKey newHk{newItem.getKey()};
+    XDCHECK(oldHk.keyHash() == newHk.keyHash());
+#endif
     return oldContainer.replace(oldItem, newItem);
   } else {
-    return oldContainer.remove(oldItem) && newContainer.add(newItem);
+    if (!oldContainer.remove(oldItem)) {
+      return false;
+    }
+    HashedKey hk{newItem.getKey()};
+    return newContainer.add(newItem, hk.keyHash());
   }
 }
 
@@ -961,27 +987,39 @@ bool CacheAllocator<CacheTrait>::replaceChainedItemInMMContainer(
   auto& oldMMContainer = getMMContainer(oldItem);
   auto& newMMContainer = getMMContainer(newItem);
   if (&oldMMContainer == &newMMContainer) {
+#ifndef NDEBUG
+    HashedKey oldHk{oldItem.getKey()};
+    HashedKey newHk{newItem.getKey()};
+    XDCHECK(oldHk.keyHash() == newHk.keyHash());
+#endif
     return oldMMContainer.replace(oldItem, newItem);
   } else {
     if (!oldMMContainer.remove(oldItem)) {
       return false;
     }
 
+    HashedKey hk{newItem.getKey()};
     // This cannot fail because a new item should not have been inserted
-    const auto newRes = newMMContainer.add(newItem);
+    const auto newRes = newMMContainer.add(newItem, hk.keyHash());
     XDCHECK(newRes);
     return true;
   }
 }
 
 template <typename CacheTrait>
-void CacheAllocator<CacheTrait>::insertInMMContainer(Item& item) {
+void CacheAllocator<CacheTrait>::insertInMMContainer(Item& item, HashedKey hk) {
   XDCHECK(!item.isInMMContainer());
   auto& mmContainer = getMMContainer(item);
-  if (!mmContainer.add(item)) {
+  if (!mmContainer.add(item, hk.keyHash())) {
     throw std::runtime_error(folly::sformat(
         "Invalid state. Node {} was already in the container.", &item));
   }
+}
+
+template <typename CacheTrait>
+void CacheAllocator<CacheTrait>::insertInMMContainer(Item& item) {
+  HashedKey hk{item.getKey()};
+  insertInMMContainer(item, hk);
 }
 
 /**
@@ -1004,6 +1042,7 @@ bool CacheAllocator<CacheTrait>::insert(const WriteHandle& handle) {
 template <typename CacheTrait>
 bool CacheAllocator<CacheTrait>::insertImpl(const WriteHandle& handle,
                                             AllocatorApiEvent event) {
+  prefetcher_.accessPreamble(handle.get());
   XDCHECK(handle);
   XDCHECK(event == AllocatorApiEvent::INSERT ||
           event == AllocatorApiEvent::INSERT_FROM_NVM);
@@ -1040,18 +1079,21 @@ bool CacheAllocator<CacheTrait>::insertImpl(const WriteHandle& handle,
 template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::WriteHandle
 CacheAllocator<CacheTrait>::insertOrReplace(const WriteHandle& handle) {
+  prefetcher_.accessPreamble(handle.get());
   XDCHECK(handle);
   if (handle->isAccessible()) {
     throw std::invalid_argument("Handle is already accessible");
   }
 
-  HashedKey hk{handle->getKey()};
+  Key key = handle->getKey();
+  prefetcher_.accessKey(key.start());
+  HashedKey hk{key};
 
-  insertInMMContainer(*(handle.getInternal()));
+  insertInMMContainer(*(handle.getInternal()), hk);
   WriteHandle replaced;
   try {
     auto lock = nvmCache_ ? nvmCache_->getItemDestructorLock(hk)
-                          : std::unique_lock<std::mutex>();
+                          : std::unique_lock<YieldableMutex>();
 
     replaced = accessContainer_->insertOrReplace(*(handle.getInternal()));
 
@@ -1121,6 +1163,7 @@ bool CacheAllocator<CacheTrait>::moveRegularItem(Item& oldItem,
     newItemHdl->markNvmClean();
   }
 
+  prefetcher_.accessMove(newItemHdl->getMemory(), oldItem.getSize(), true);
   // Execute the move callback. We cannot make any guarantees about the
   // consistency of the old item beyond this point, because the callback can
   // do more than a simple memcpy() e.g. update external references. If there
@@ -1228,6 +1271,7 @@ bool CacheAllocator<CacheTrait>::moveChainedItem(ChainedItem& oldItem,
   XDCHECK_EQ(reinterpret_cast<uintptr_t>(parentPtr),
              reinterpret_cast<uintptr_t>(&oldItem.getParentItem(compressor_)));
 
+  prefetcher_.accessMove(newItemHdl->getMemory(), oldItem.getSize(), true);
   // Invoke the move callback to fix up any user data related to the chain
   config_.moveCb(oldItem, *newItemHdl, parentPtr);
 
@@ -1281,6 +1325,7 @@ CacheAllocator<CacheTrait>::getNextCandidate(PoolId pid,
       (*stats_.evictionAttempts)[pid][cid].inc();
 
       auto* toRecycle_ = itr.get();
+      prefetcher_.accessEvictionIterator(toRecycle_);
       auto* candidate_ =
           toRecycle_->isChainedItem()
               ? &toRecycle_->asChainedItem().getParentItem(compressor_)
@@ -1345,11 +1390,12 @@ CacheAllocator<CacheTrait>::getNextCandidate(PoolId pid,
 template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::Item*
 CacheAllocator<CacheTrait>::findEviction(PoolId pid, ClassId cid) {
+  for (int shard = 0; shard < MMType::kShards; shard++) {
   // Keep searching for a candidate until we were able to evict it
   // or until the search limit has been exhausted
   unsigned int searchTries = 0;
   while (config_.evictionSearchTries == 0 ||
-         config_.evictionSearchTries > searchTries) {
+         config_.evictionSearchTries / MMType::kShards + 1 > searchTries) {
     auto [candidate, toRecycle] = getNextCandidate(pid, cid, searchTries);
 
     // Reached the end of the eviction queue but doulen't find a candidate,
@@ -1379,6 +1425,7 @@ CacheAllocator<CacheTrait>::findEviction(PoolId pid, ClassId cid) {
     if (ret == ReleaseRes::kRecycled) {
       return toRecycle;
     }
+  }
   }
   return nullptr;
 }
@@ -1572,7 +1619,7 @@ CacheAllocator<CacheTrait>::removeImpl(HashedKey hk,
   bool success = false;
   {
     auto lock = nvmCache_ ? nvmCache_->getItemDestructorLock(hk)
-                          : std::unique_lock<std::mutex>();
+                          : std::unique_lock<YieldableMutex>();
 
     success = accessContainer_->remove(item);
 
@@ -2166,7 +2213,7 @@ void CacheAllocator<CacheTrait>::createMMContainers(const PoolId pid,
             ? pool.getAllocationClass(static_cast<ClassId>(cid))
                   .getAllocsPerSlab()
             : 0);
-    mmContainers_[pid][cid].reset(new MMContainer(config, compressor_));
+    mmContainers_[pid][cid].reset(new MMContainer(config, compressor_, prefetcher_));
   }
 }
 
@@ -3104,6 +3151,7 @@ bool CacheAllocator<CacheTrait>::stopWorkers(std::chrono::seconds timeout) {
   success &= stopPoolResizer(timeout);
   success &= stopMemMonitor(timeout);
   success &= stopReaper(timeout);
+  success &= stopCheckpointTraceDumper(timeout);
   return success;
 }
 
@@ -3200,7 +3248,8 @@ template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::MMContainers
 CacheAllocator<CacheTrait>::deserializeMMContainers(
     Deserializer& deserializer,
-    const typename Item::PtrCompressor& compressor) {
+    const typename Item::PtrCompressor& compressor,
+    const typename Item::Prefetcher& prefetcher) {
   const auto container =
       deserializer.deserialize<MMSerializationTypeContainer>();
 
@@ -3213,7 +3262,7 @@ CacheAllocator<CacheTrait>::deserializeMMContainers(
       auto j = static_cast<ClassId>(kv.first);
       MMContainerPtr ptr =
           std::make_unique<typename MMContainerPtr::element_type>(kv.second,
-                                                                  compressor);
+                                                                  compressor, prefetcher);
       auto config = ptr->getConfig();
       config.addExtraConfig(config_.trackTailHits
                                 ? pool.getAllocationClass(j).getAllocsPerSlab()
@@ -3312,6 +3361,7 @@ void CacheAllocator<CacheTrait>::forEachChainedItem(
   while (head) {
     func(*head);
     head = head->getNext(compressor_);
+    prefetcher_.accessChainedItem(head);
   }
 }
 
@@ -3544,6 +3594,17 @@ bool CacheAllocator<CacheTrait>::startNewReaper(
 }
 
 template <typename CacheTrait>
+bool CacheAllocator<CacheTrait>::startNewCheckpointTraceDumper (
+    std::chrono::milliseconds interval) {
+#ifdef ENABLE_CHECKPOINT_TRACE
+  if (!startNewWorker("CheckpointTraceDumper", checkpointTraceDumper_, interval, config_.cacheDir)) {
+    return false;
+  }
+#endif
+  return true;
+}
+
+template <typename CacheTrait>
 bool CacheAllocator<CacheTrait>::stopPoolRebalancer(
     std::chrono::seconds timeout) {
   auto res = stopWorker("PoolRebalancer", poolRebalancer_, timeout);
@@ -3589,6 +3650,11 @@ bool CacheAllocator<CacheTrait>::stopReaper(std::chrono::seconds timeout) {
     config_.reaperInterval = std::chrono::seconds{0};
   }
   return res;
+}
+
+template <typename CacheTrait>
+bool CacheAllocator<CacheTrait>::stopCheckpointTraceDumper(std::chrono::seconds timeout) {
+  return stopWorker("CheckpointTraceDumper", checkpointTraceDumper_, timeout);
 }
 
 template <typename CacheTrait>

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -138,6 +139,8 @@ struct ReplayGeneratorConfig : public JSONConfig {
   // trace sample. E.g., additional ML features can be put here
   uint32_t numExtraFields{0};
 
+  size_t maxKeyPrefixSize{200};
+
   // For each aggregation field, we track the statistics broken down by
   // specific aggregation values. this map specifies the values for which
   // stats are aggregated by per field.
@@ -191,6 +194,10 @@ struct StressorConfig : public JSONConfig {
   // for manually configured synthetic workloads.
   bool onlySetIfMiss{false};
 
+  uint64_t numFibers{0};
+  uint64_t yieldPerOps{0};
+  bool affinitizeThreads{false};
+
   // if enabled, initializes an item with random bytes. For consistency mode,
   // this option is ignored since the consistency check fills in a sequence
   // number into the item.
@@ -239,6 +246,9 @@ struct StressorConfig : public JSONConfig {
   // relative to the configPath
   std::string traceFileName{};
   std::vector<std::string> traceFileNames{};
+
+  bool traceFileMultiStreams{false};
+  uint64_t numTraceFileCheckpoints{UINT64_MAX};
 
   // location of the path for the files referenced inside the json. If not
   // specified, it defaults to the path of the json file being parsed.

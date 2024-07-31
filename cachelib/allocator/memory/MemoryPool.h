@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +26,7 @@
 #include "cachelib/allocator/memory/AllocationClass.h"
 #include "cachelib/allocator/memory/MemoryAllocatorStats.h"
 #include "cachelib/allocator/memory/Slab.h"
+#include "cachelib/common/Mutex.h"
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wconversion"
@@ -362,7 +364,7 @@ class MemoryPool {
   SlabReleaseContext releaseFromFreeSlabs();
 
   // mutex for serializing access to freeSlabs_ and the currSlabAllocSize_.
-  mutable std::mutex lock_;
+  mutable YieldableMutex lock_;
 
   // the id for this memory pool
   const PoolId id_{-1};

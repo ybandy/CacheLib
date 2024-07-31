@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,7 +26,7 @@ include "cachelib/allocator/datastruct/serialize/objects.thrift"
 struct SlabAllocatorObject {
   2: required i64 memorySize;
   4: required bool canAllocate;
-  5: required map<byte, i64> memoryPoolSize;
+  5: required map<i16, i64> memoryPoolSize;
   7: required i64 slabSize;
   8: required i64 minAllocSize;
   9: required i32 nextSlabIdx;
@@ -45,7 +46,7 @@ struct AllocationClassObject {
 }
 
 struct MemoryPoolObject {
-  1: required byte id;
+  1: required i16 id;
   2: required i64 maxSize;
   3: required i64 currSlabAllocSize;
   4: required i64 currAllocSize;
@@ -59,8 +60,8 @@ struct MemoryPoolObject {
 
 struct MemoryPoolManagerObject {
   1: list<MemoryPoolObject> pools;
-  2: map<string, byte> poolsByName;
-  3: byte nextPoolId;
+  2: map<string, i16> poolsByName;
+  3: i16 nextPoolId;
 }
 
 struct MemoryAllocatorObject {

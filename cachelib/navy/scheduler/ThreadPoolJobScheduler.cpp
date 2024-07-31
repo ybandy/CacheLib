@@ -1,5 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2024 Kioxia Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,6 +34,14 @@ std::unique_ptr<JobScheduler> createOrderedThreadPoolJobScheduler(
     unsigned int writerThreads,
     unsigned int reqOrderShardPower) {
   return std::make_unique<OrderedThreadPoolJobScheduler>(
+      readerThreads, writerThreads, reqOrderShardPower);
+}
+
+std::unique_ptr<JobScheduler> createTryBlockingJobScheduler(
+    unsigned int readerThreads,
+    unsigned int writerThreads,
+    unsigned int reqOrderShardPower) {
+  return std::make_unique<TryBlockingJobScheduler>(
       readerThreads, writerThreads, reqOrderShardPower);
 }
 
@@ -270,6 +279,123 @@ void OrderedThreadPoolJobScheduler::getCounters(const CounterVisitor& v) const {
   scheduler_.getCounters(v);
   v("navy_req_order_spooled", numSpooled_.get(),
     CounterVisitor::CounterType::RATE);
+  v("navy_req_order_curr_spool_size", currSpooled_.get());
+}
+
+/*
+TryBlockingJobScheduler::TryBlockingJobScheduler(
+    size_t readerThreads, size_t writerThreads, size_t numShardsPower)
+    : mutexes_(numShards(numShardsPower)),
+      numShardsPower_(numShardsPower),
+      scheduler_(readerThreads, writerThreads, numShardsPower) {}
+
+void TryBlockingJobScheduler::enqueue(Job job, folly::StringPiece name, JobType type) {
+  scheduler_.enqueue(std::move(job), name, type);
+}
+
+void TryBlockingJobScheduler::enqueueWithKey(Job job, folly::StringPiece name, JobType type, uint64_t key) {
+	const auto shard = key % numShards(numShardsPower_);
+	if (mutexes_[shard].try_lock()) {
+		while (job() == JobExitCode::Reschedule);
+		job = Job{};
+		mutexes_[shard].unlock();
+	} else {
+		scheduler_.enqueueWithKey(std::move(job), name, type, key);
+	}
+}
+
+void TryBlockingJobScheduler::finish() {
+  scheduler_.finish();
+}
+
+void TryBlockingJobScheduler::getCounters(const CounterVisitor& v) const {
+  scheduler_.getCounters(v);
+}
+*/
+
+TryBlockingJobScheduler::TryBlockingJobScheduler(
+    size_t readerThreads, size_t writerThreads, size_t numShardsPower)
+    : mutexes_(numShards(numShardsPower)),
+      pendingJobs_(numShards(numShardsPower)),
+      shouldSpool_(numShards(numShardsPower), false),
+      numShardsPower_(numShardsPower),
+      scheduler_(readerThreads, writerThreads) {}
+
+void TryBlockingJobScheduler::enqueueWithKey(Job job,
+                                                   folly::StringPiece name,
+                                                   JobType type,
+                                                   uint64_t key) {
+  const auto shard = key % numShards(numShardsPower_);
+  JobParams params{std::move(job), type, name, key};
+  std::lock_guard<YieldableMutex> l(mutexes_[shard]);
+  if (shouldSpool_[shard]) {
+    // add to the pending jobs since there is already a job for this key
+    pendingJobs_[shard].emplace_back(std::move(params));
+    numSpooled_.inc();
+    currSpooled_.inc();
+  } else {
+    shouldSpool_[shard] = true;
+
+    mutexes_[shard].unlock();
+    auto ret = params.job();
+    mutexes_[shard].lock();
+
+    if (ret == JobExitCode::Done) {
+      scheduleNextJobLocked(shard);
+    } else {
+      XDCHECK_EQ(ret, JobExitCode::Reschedule);
+      scheduleJobLocked(std::move(params), shard);
+    }
+  }
+}
+
+void TryBlockingJobScheduler::scheduleJobLocked(JobParams params,
+                                                      uint64_t shard) {
+  scheduler_.enqueueWithKey(
+      [this, j = std::move(params.job), shard]() mutable {
+        auto ret = j();
+        if (ret == JobExitCode::Done) {
+          scheduleNextJob(shard);
+        } else {
+          XDCHECK_EQ(ret, JobExitCode::Reschedule);
+        }
+        return ret;
+      },
+      params.name,
+      params.type,
+      params.key);
+}
+
+void TryBlockingJobScheduler::scheduleNextJob(uint64_t shard) {
+  std::lock_guard<YieldableMutex> l(mutexes_[shard]);
+  scheduleNextJobLocked(shard);
+}
+
+void TryBlockingJobScheduler::scheduleNextJobLocked(uint64_t shard) {
+  if (pendingJobs_[shard].empty()) {
+    shouldSpool_[shard] = false;
+    return;
+  }
+
+  currSpooled_.dec();
+  scheduleJobLocked(std::move(pendingJobs_[shard].front()), shard);
+  pendingJobs_[shard].pop_front();
+}
+
+void TryBlockingJobScheduler::enqueue(Job job,
+                                            folly::StringPiece name,
+                                            JobType type) {
+  scheduler_.enqueue(std::move(job), name, type);
+}
+
+void TryBlockingJobScheduler::finish() {
+  scheduler_.finish();
+  XDCHECK_EQ(currSpooled_.get(), 0ULL);
+}
+
+void TryBlockingJobScheduler::getCounters(const CounterVisitor& v) const {
+  scheduler_.getCounters(v);
+  v("navy_req_order_spooled", numSpooled_.get());
   v("navy_req_order_curr_spool_size", currSpooled_.get());
 }
 
