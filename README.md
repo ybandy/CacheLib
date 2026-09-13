@@ -1,3 +1,7 @@
+Forked and modified to be used from [CXL-KVS](https://github.com/ybandy/cxlkvs).
+
+---
+
 <p align="center">
   <img width="500" height="140" alt="CacheLib" src="website/static/img/CacheLib-Logo-Large-transp.png">
 </p>
